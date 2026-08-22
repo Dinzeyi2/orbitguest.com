@@ -5,10 +5,21 @@ from pathlib import Path
 from datetime import datetime, timezone
 from orbit.db import Database
 from orbit.service import OrbitService
+from orbit.resend import ResendInboundClient
+import hashlib
+import hmac
+import json
+import time
 
 class FakeExtractor:
     def extract(self, content, content_type, filename):
         return {"vendor": "Fresh Foods", "invoice_number": "INV-42", "invoice_date": "2026-08-22", "currency": "USD", "subtotal_cents": 9000, "tax_cents": 1000, "total_cents": 10000, "confidence": .97, "items": [{"sku": "RIB-1", "description": "Baby Back Ribs", "quantity": 40, "unit": "case", "unit_price_cents": 225, "line_total_cents": 9000}]}
+
+class FakeResend(ResendInboundClient):
+    def _json(self, path):
+        if path.endswith("/attachments"):
+            return {"data": [{"id": "att-1", "filename": "invoice.pdf", "content_type": "application/pdf", "content_base64": base64.b64encode(b"%PDF-live").decode()}]}
+        return {"data": {"message_id": "mail-live", "from": "vendor@example.com", "to": ["restaurant@invoices.orbitguest.com"], "subject": "Invoice", "attachments": [{"id": "att-1", "filename": "invoice.pdf", "content_type": "application/pdf"}]}}
 
 class OrbitFlowTest(unittest.TestCase):
     def setUp(self):
@@ -66,5 +77,21 @@ class OrbitFlowTest(unittest.TestCase):
             path = Path(root) / "new" / "nested" / "orbit.db"
             Database(str(path))
             self.assertTrue(path.is_file())
+
+    def test_resend_svix_signature_verification(self):
+        secret_bytes = b"test-webhook-secret"
+        secret = "whsec_" + base64.b64encode(secret_bytes).decode()
+        client = ResendInboundClient("re_test", secret)
+        body = json.dumps({"type": "email.received"}).encode()
+        timestamp, message_id = str(int(time.time())), "msg_test"
+        signature = base64.b64encode(hmac.new(secret_bytes, f"{message_id}.{timestamp}.".encode() + body, hashlib.sha256).digest()).decode()
+        headers = {"svix-id": message_id, "svix-timestamp": timestamp, "svix-signature": f"v1,{signature}"}
+        self.assertTrue(client.verify(body, headers))
+        self.assertFalse(client.verify(body + b" ", headers))
+
+    def test_resend_event_is_normalized_with_downloaded_attachment(self):
+        email = FakeResend("re_test", "secret").normalize({"type": "email.received", "data": {"email_id": "email-1"}})
+        self.assertEqual(email["recipient"], "restaurant@invoices.orbitguest.com")
+        self.assertEqual(base64.b64decode(email["attachments"][0]["content_base64"]), b"%PDF-live")
 
 if __name__ == "__main__": unittest.main()

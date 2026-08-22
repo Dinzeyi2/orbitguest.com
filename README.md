@@ -35,6 +35,9 @@ Create a merchant, then use the returned `api_key` as `Authorization: Bearer ...
 See [`docs/API.md`](docs/API.md) for the complete workflow.
 See [`docs/RAILWAY.md`](docs/RAILWAY.md) for Railway and email-domain setup.
 
+For live email, configure Resend to send `email.received` events to
+`/v1/webhooks/resend`, then set `RESEND_API_KEY` and `RESEND_WEBHOOK_SECRET`.
+
 By default Orbit uses `/tmp/orbit/orbit.db`, so a new Railway deployment starts even
 before a volume is configured. For persistent production data, mount a volume at
 `/data` and set `ORBIT_DB_PATH=/data/orbit.db` and

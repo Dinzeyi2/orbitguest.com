@@ -2,14 +2,17 @@ import argparse
 import json
 import os
 from pathlib import Path
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 from .db import Database
 from .service import OrbitService
 from .extraction import OpenAIInvoiceExtractor
+from .resend import ResendInboundClient, ResendError
 
 class Handler(BaseHTTPRequestHandler):
     service = None
+    resend = None
     def _send(self, status, body):
         payload = json.dumps(body).encode()
         self.send_response(status); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(payload))); self.end_headers(); self.wfile.write(payload)
@@ -22,6 +25,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             path, raw = urlparse(self.path).path, self._raw_body()
             data = json.loads(raw)
+            if path == "/v1/webhooks/resend":
+                if not self.resend or not self.resend.verify(raw, {key.lower(): value for key, value in self.headers.items()}):
+                    return self._send(401, {"error": "invalid Resend signature"})
+                if data.get("type") != "email.received": return self._send(200, {"status": "ignored"})
+                threading.Thread(target=self._process_resend, args=(data,), daemon=True).start()
+                return self._send(202, {"status": "accepted"})
             if path == "/v1/inbound/email":
                 if not self.service.verify_inbound_signature(raw, self.headers.get("X-Orbit-Signature")):
                     return self._send(401, {"error": "invalid inbound signature"})
@@ -50,6 +59,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, result)
         except KeyError as error: self._send(404, {"error": str(error)})
     def log_message(self, *_): pass
+    def _process_resend(self, event):
+        try: self.service.receive_email(self.resend.normalize(event))
+        except Exception as error: print(f"Resend email processing failed: {error}", flush=True)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -59,6 +71,8 @@ def main():
     db_path = args.db or os.getenv("ORBIT_DB_PATH") or "/tmp/orbit/orbit.db"
     storage_path = os.getenv("ORBIT_STORAGE_DIR") or str(Path(db_path).parent / "documents")
     Handler.service = OrbitService(Database(db_path), OpenAIInvoiceExtractor(), storage_path)
+    resend_key, resend_secret = os.getenv("RESEND_API_KEY"), os.getenv("RESEND_WEBHOOK_SECRET")
+    Handler.resend = ResendInboundClient(resend_key, resend_secret) if resend_key and resend_secret else None
     ThreadingHTTPServer(("0.0.0.0", int(os.getenv("PORT", args.port))), Handler).serve_forever()
 
 if __name__ == "__main__": main()
