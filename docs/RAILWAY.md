@@ -43,6 +43,10 @@ it readable for vendors while preventing collisions and easy address guessing. R
 receives the message, signs the webhook, and Orbit downloads each attachment before
 passing it to OpenAI.
 
+If Railway logs previously showed Cloudflare `Error 1010: browser_signature_banned`,
+deploy commit `HEAD` or newer. Orbit now identifies its server-side Resend API requests
+with an explicit application user agent instead of Python's blocked default signature.
+
 ## OpenAI extraction
 
 The model is configurable through `OPENAI_INVOICE_MODEL`. The default is

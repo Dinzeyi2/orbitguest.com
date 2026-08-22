@@ -12,6 +12,7 @@ class ResendError(RuntimeError): pass
 
 class ResendInboundClient:
     API = "https://api.resend.com"
+    USER_AGENT = "OrbitGuest/0.1 (+https://orbitguest.com)"
 
     def __init__(self, api_key, webhook_secret, api_base=None):
         self.api_key = api_key
@@ -34,7 +35,11 @@ class ResendInboundClient:
         return any(part.startswith("v1,") and hmac.compare_digest(part[3:], expected) for part in signatures)
 
     def _json(self, path):
-        request = urllib.request.Request(self.api_base + path, headers={"Authorization": f"Bearer {self.api_key}", "Accept": "application/json"})
+        request = urllib.request.Request(self.api_base + path, headers={
+            "Authorization": f"Bearer {self.api_key}",
+            "Accept": "application/json",
+            "User-Agent": self.USER_AGENT,
+        })
         try:
             with urllib.request.urlopen(request, timeout=30) as response: return json.load(response)
         except urllib.error.HTTPError as error:
@@ -42,7 +47,11 @@ class ResendInboundClient:
         except (OSError, ValueError) as error: raise ResendError(f"Resend API failed: {error}") from error
 
     def _download(self, url):
-        request = urllib.request.Request(url, headers={"Authorization": f"Bearer {self.api_key}"})
+        request = urllib.request.Request(url, headers={
+            "Authorization": f"Bearer {self.api_key}",
+            "Accept": "application/octet-stream",
+            "User-Agent": self.USER_AGENT,
+        })
         try:
             with urllib.request.urlopen(request, timeout=30) as response: return response.read()
         except urllib.error.HTTPError as error: raise ResendError(f"Attachment download failed ({error.code})") from error

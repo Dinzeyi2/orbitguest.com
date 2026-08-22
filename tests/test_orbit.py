@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import time
+from unittest.mock import patch
 
 class FakeExtractor:
     def extract(self, content, content_type, filename):
@@ -93,5 +94,15 @@ class OrbitFlowTest(unittest.TestCase):
         email = FakeResend("re_test", "secret").normalize({"type": "email.received", "data": {"email_id": "email-1"}})
         self.assertEqual(email["recipient"], "restaurant@invoices.orbitguest.com")
         self.assertEqual(base64.b64decode(email["attachments"][0]["content_base64"]), b"%PDF-live")
+
+    def test_resend_requests_use_explicit_user_agent(self):
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+            def read(self): return b'{}'
+        with patch("urllib.request.urlopen", return_value=Response()) as urlopen:
+            ResendInboundClient("re_test", "secret")._json("/emails/receiving/test")
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.get_header("User-agent"), ResendInboundClient.USER_AGENT)
 
 if __name__ == "__main__": unittest.main()
