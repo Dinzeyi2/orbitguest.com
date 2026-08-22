@@ -1,0 +1,14 @@
+[project]
+name = "orbit-guest"
+version = "0.1.0"
+description = "Consent-first restaurant intelligence and retention backend"
+requires-python = ">=3.11"
+
+[project.scripts]
+orbit = "orbit.api:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
