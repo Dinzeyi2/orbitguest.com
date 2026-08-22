@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 from .db import Database
@@ -51,7 +52,13 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_): pass
 
 def main():
-    parser = argparse.ArgumentParser(); parser.add_argument("--db", default="orbit.db"); parser.add_argument("--port", type=int, default=8080); args = parser.parse_args()
-    Handler.service = OrbitService(Database(args.db), OpenAIInvoiceExtractor(), os.getenv("ORBIT_STORAGE_DIR")); ThreadingHTTPServer(("0.0.0.0", int(os.getenv("PORT", args.port))), Handler).serve_forever()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--db", default=None)
+    parser.add_argument("--port", type=int, default=8080)
+    args = parser.parse_args()
+    db_path = args.db or os.getenv("ORBIT_DB_PATH") or "/tmp/orbit/orbit.db"
+    storage_path = os.getenv("ORBIT_STORAGE_DIR") or str(Path(db_path).parent / "documents")
+    Handler.service = OrbitService(Database(db_path), OpenAIInvoiceExtractor(), storage_path)
+    ThreadingHTTPServer(("0.0.0.0", int(os.getenv("PORT", args.port))), Handler).serve_forever()
 
 if __name__ == "__main__": main()

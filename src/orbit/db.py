@@ -1,5 +1,6 @@
 import sqlite3
 from contextlib import contextmanager
+from pathlib import Path
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -84,6 +85,15 @@ CREATE INDEX IF NOT EXISTS idx_documents_email ON invoice_documents(inbound_emai
 class Database:
     def __init__(self, path: str = "orbit.db"):
         self.path = path
+        if path != ":memory:":
+            database_dir = Path(path).expanduser().resolve().parent
+            try:
+                database_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as error:
+                raise RuntimeError(
+                    f"Orbit cannot create the database directory '{database_dir}'. "
+                    "Set ORBIT_DB_PATH to a writable path or mount a Railway volume."
+                ) from error
         with self.connect() as connection:
             connection.executescript(SCHEMA)
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(merchants)")}

@@ -28,13 +28,17 @@ CVV, track data, or other raw cardholder data to this service.
 ## Run
 
 ```bash
-OPENAI_API_KEY=... INBOUND_EMAIL_SECRET=... \
-ORBIT_STORAGE_DIR=/data/documents PYTHONPATH=src python -m orbit.api --db /data/orbit.db
+OPENAI_API_KEY=... INBOUND_EMAIL_SECRET=... PYTHONPATH=src python -m orbit.api
 ```
 
 Create a merchant, then use the returned `api_key` as `Authorization: Bearer ...`.
 See [`docs/API.md`](docs/API.md) for the complete workflow.
 See [`docs/RAILWAY.md`](docs/RAILWAY.md) for Railway and email-domain setup.
+
+By default Orbit uses `/tmp/orbit/orbit.db`, so a new Railway deployment starts even
+before a volume is configured. For persistent production data, mount a volume at
+`/data` and set `ORBIT_DB_PATH=/data/orbit.db` and
+`ORBIT_STORAGE_DIR=/data/documents`.
 
 ## Test
 

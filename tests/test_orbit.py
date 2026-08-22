@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 import base64
+from pathlib import Path
 from datetime import datetime, timezone
 from orbit.db import Database
 from orbit.service import OrbitService
@@ -59,5 +60,11 @@ class OrbitFlowTest(unittest.TestCase):
         dashboard = self.service.invoice_dashboard(self.merchant)
         self.assertEqual(dashboard["summary"]["invoice_count"], 1)
         self.assertEqual(dashboard["invoices"][0]["items"][0]["description"], "Baby Back Ribs")
+
+    def test_database_creates_missing_parent_directory(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "new" / "nested" / "orbit.db"
+            Database(str(path))
+            self.assertTrue(path.is_file())
 
 if __name__ == "__main__": unittest.main()

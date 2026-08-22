@@ -3,10 +3,22 @@
 ## Deploy
 
 1. Create a Railway service from this repository.
-2. Add a persistent volume mounted at `/data`.
-3. Set `OPENAI_API_KEY`, a long random `INBOUND_EMAIL_SECRET`,
-   `ORBIT_STORAGE_DIR=/data/documents`, and `OPENAI_INVOICE_MODEL=gpt-4.1-mini`.
-4. Railway uses the included `Procfile` and `/health` endpoint.
+2. Deploy once with no variables. Orbit now starts safely using
+   `/tmp/orbit/orbit.db`, and Railway should pass `/health`.
+3. Add a persistent volume mounted at `/data` so invoices survive redeployments.
+4. Add these Railway variables:
+   - `ORBIT_DB_PATH=/data/orbit.db`
+   - `ORBIT_STORAGE_DIR=/data/documents`
+   - `OPENAI_API_KEY=<your OpenAI API key>`
+   - `INBOUND_EMAIL_SECRET=<a long random secret>`
+   - `OPENAI_INVOICE_MODEL=gpt-4.1-mini`
+5. Redeploy. Railway uses the included start command, its injected `PORT`, and the
+   `/health` endpoint.
+
+The previous start command always used `/data/orbit.db`. Railway failed when `/data`
+did not exist because no volume was mounted. The application now creates database
+directories automatically and starts from a writable `/tmp` default when the volume
+has not been configured.
 
 SQLite plus a volume is appropriate for an MVP with one application replica. Before
 horizontal scaling, move relational data to Railway Postgres and documents to encrypted
