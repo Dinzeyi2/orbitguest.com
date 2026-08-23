@@ -54,6 +54,24 @@ CREATE TABLE IF NOT EXISTS invoice_lines (
  unit_price_cents INTEGER NOT NULL, line_total_cents INTEGER NOT NULL,
  FOREIGN KEY(invoice_id) REFERENCES invoices(id)
 );
+CREATE TABLE IF NOT EXISTS catalog_products (
+ id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, vendor TEXT NOT NULL,
+ product_key TEXT NOT NULL, sku TEXT, canonical_name TEXT NOT NULL,
+ normalized_name TEXT NOT NULL, current_version_id TEXT,
+ current_invoice_date TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ UNIQUE(merchant_id, vendor, product_key),
+ FOREIGN KEY(merchant_id) REFERENCES merchants(id)
+);
+CREATE TABLE IF NOT EXISTS product_versions (
+ id TEXT PRIMARY KEY, product_id TEXT NOT NULL, invoice_id TEXT NOT NULL,
+ invoice_line_id TEXT NOT NULL, effective_date TEXT NOT NULL,
+ quantity REAL NOT NULL, unit TEXT NOT NULL, unit_price_cents INTEGER NOT NULL,
+ line_total_cents INTEGER NOT NULL, is_current INTEGER NOT NULL DEFAULT 0,
+ recorded_at TEXT NOT NULL,
+ FOREIGN KEY(product_id) REFERENCES catalog_products(id),
+ FOREIGN KEY(invoice_id) REFERENCES invoices(id),
+ FOREIGN KEY(invoice_line_id) REFERENCES invoice_lines(id)
+);
 CREATE TABLE IF NOT EXISTS inventory_events (
  id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, invoice_id TEXT, ingredient TEXT NOT NULL,
  normalized_ingredient TEXT NOT NULL, quantity REAL NOT NULL, unit TEXT NOT NULL,
@@ -80,6 +98,8 @@ CREATE INDEX IF NOT EXISTS idx_items_name ON order_items(normalized_name);
 CREATE INDEX IF NOT EXISTS idx_consent_guest ON consents(merchant_id, guest_id, channel, captured_at);
 CREATE INDEX IF NOT EXISTS idx_invoice_lines_invoice ON invoice_lines(invoice_id);
 CREATE INDEX IF NOT EXISTS idx_documents_email ON invoice_documents(inbound_email_id);
+CREATE INDEX IF NOT EXISTS idx_products_merchant ON catalog_products(merchant_id, vendor, normalized_name);
+CREATE INDEX IF NOT EXISTS idx_product_versions_history ON product_versions(product_id, effective_date DESC, recorded_at DESC);
 """
 
 class Database:

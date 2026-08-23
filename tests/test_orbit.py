@@ -16,6 +16,10 @@ class FakeExtractor:
     def extract(self, content, content_type, filename):
         return {"vendor": "Fresh Foods", "invoice_number": "INV-42", "invoice_date": "2026-08-22", "currency": "USD", "subtotal_cents": 9000, "tax_cents": 1000, "total_cents": 10000, "confidence": .97, "items": [{"sku": "RIB-1", "description": "Baby Back Ribs", "quantity": 40, "unit": "case", "unit_price_cents": 225, "line_total_cents": 9000}]}
 
+class SequenceExtractor:
+    def __init__(self, outputs): self.outputs = iter(outputs)
+    def extract(self, *_): return next(self.outputs)
+
 class FakeResend(ResendInboundClient):
     def _json(self, path):
         if path.endswith("/attachments"):
@@ -104,5 +108,27 @@ class OrbitFlowTest(unittest.TestCase):
             ResendInboundClient("re_test", "secret")._json("/emails/receiving/test")
         request = urlopen.call_args.args[0]
         self.assertEqual(request.get_header("User-agent"), ResendInboundClient.USER_AGENT)
+
+    def test_product_history_keeps_old_invoice_and_new_current_value(self):
+        base = {"vendor": "Fresh Foods", "currency": "USD", "subtotal_cents": 100, "tax_cents": 0, "total_cents": 100, "confidence": .99}
+        item = {"sku": "RIB-1", "description": "Baby Back Ribs", "quantity": 1, "unit": "case", "line_total_cents": 100}
+        outputs = [
+            {**base, "invoice_number": "NEW", "invoice_date": "2026-08-20", "items": [{**item, "unit_price_cents": 100}]},
+            {**base, "invoice_number": "OLD", "invoice_date": "2025-01-10", "items": [{**item, "unit_price_cents": 70}]},
+            {**base, "invoice_number": "LATEST", "invoice_date": "2026-09-01", "items": [{**item, "unit_price_cents": 120}, {**item, "sku": "SAUCE-1", "description": "BBQ Sauce", "unit_price_cents": 50, "line_total_cents": 50}]},
+        ]
+        self.service.extractor = SequenceExtractor(outputs)
+        with self.service.db.connect() as c: address = c.execute("SELECT inbound_alias FROM merchants WHERE id=?", (self.merchant,)).fetchone()["inbound_alias"]
+        def receive(message):
+            return self.service.receive_email({"message_id": message, "sender": "vendor@test", "recipient": address, "attachments": [{"filename": f"{message}.pdf", "content_type": "application/pdf", "content_base64": base64.b64encode(message.encode()).decode()}]})
+        receive("new"); receive("old"); receive("latest")
+        products = self.service.product_dashboard(self.merchant)["products"]
+        self.assertEqual(len(products), 2)
+        ribs = next(product for product in products if product["sku"] == "RIB-1")
+        self.assertEqual(ribs["unit_price_cents"], 120)
+        self.assertEqual(ribs["version_count"], 3)
+        history = self.service.product_history(self.merchant, ribs["id"])["history"]
+        self.assertEqual([row["invoice_number"] for row in history], ["LATEST", "NEW", "OLD"])
+        self.assertEqual(sum(row["is_current"] for row in history), 1)
 
 if __name__ == "__main__": unittest.main()

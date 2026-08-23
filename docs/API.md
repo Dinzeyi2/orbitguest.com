@@ -32,6 +32,12 @@ is idempotent. Attachments are limited to 20 MB and supported types are PDF,
 JPEG, PNG, WebP, and HEIC.
 5. `GET /v1/dashboard/invoices` returns the restaurant's summary, invoices, and
    fully extracted line items for a dashboard tracking table.
+   `GET /v1/dashboard/products` returns one current row per vendor product, and
+   `GET /v1/products/{product_id}/history` returns every historical version with
+   its original invoice. Old invoices never replace a newer current value; newer
+   invoices update the current snapshot while preserving every prior version.
+   Products are matched within a restaurant and vendor by SKU when present, otherwise
+   by normalized product description.
 6. `GET /v1/campaigns` returns consent-filtered inventory campaigns.
 7. After the delivery provider confirms dispatch, call
    `POST /v1/campaigns/{id}/sent`.

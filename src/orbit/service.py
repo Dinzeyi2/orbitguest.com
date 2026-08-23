@@ -11,6 +11,10 @@ from datetime import datetime, timezone, timedelta
 def now(): return datetime.now(timezone.utc).isoformat()
 def uid(prefix): return f"{prefix}_{uuid.uuid4().hex}"
 def normalize(value): return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+def invoice_date_key(value):
+    """Return a sortable ISO date, keeping malformed/unknown dates safely oldest."""
+    match = re.match(r"^(\d{4})-(\d{2})-(\d{2})", value or "")
+    return match.group(0) if match else "0001-01-01"
 
 class OrbitService:
     ALLOWED_TYPES = {"application/pdf", "image/jpeg", "image/png", "image/webp", "image/heic"}
@@ -88,11 +92,56 @@ class OrbitService:
             c.execute("""INSERT INTO invoices(id,merchant_id,external_id,vendor,invoice_date,currency,subtotal_cents,tax_cents,total_cents,source_message_id,raw_text,status,created_at)
                          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (invoice_id, merchant, external, extracted["vendor"], extracted["invoice_date"] or email_data.get("received_at", now()), extracted["currency"], extracted["subtotal_cents"], extracted["tax_cents"], extracted["total_cents"], email_data["message_id"], None, "processed" if extracted["confidence"] >= .75 else "needs_review", now()))
             for item in extracted["items"]:
-                c.execute("INSERT INTO invoice_lines VALUES(?,?,?,?,?,?,?,?,?)", (uid("line"), invoice_id, item.get("sku"), item["description"], normalize(item["description"]), item["quantity"], item["unit"], item["unit_price_cents"], item["line_total_cents"]))
+                line_id = uid("line")
+                c.execute("INSERT INTO invoice_lines VALUES(?,?,?,?,?,?,?,?,?)", (line_id, invoice_id, item.get("sku"), item["description"], normalize(item["description"]), item["quantity"], item["unit"], item["unit_price_cents"], item["line_total_cents"]))
                 c.execute("INSERT INTO inventory_events VALUES(?,?,?,?,?,?,?,?,?)", (uid("ive"), merchant, invoice_id, item["description"], normalize(item["description"]), item["quantity"], item["unit"], item["unit_price_cents"], extracted["invoice_date"] or email_data.get("received_at", now())))
+                self._record_product_version(c, merchant, extracted["vendor"], invoice_id, line_id, extracted["invoice_date"] or email_data.get("received_at", now()), item)
             c.execute("UPDATE invoice_documents SET invoice_id=?,extraction_status=?,extraction_confidence=?,extraction_json=? WHERE id=?", (invoice_id, "processed" if extracted["confidence"] >= .75 else "needs_review", extracted["confidence"], json.dumps(extracted), document_id))
             self._audit(c, merchant, "document.extracted", "invoice_document", document_id, {"invoice_id": invoice_id, "confidence": extracted["confidence"]})
         return invoice_id
+
+    def _record_product_version(self, c, merchant, vendor, invoice_id, line_id, effective_date, item):
+        """Append a product version and update the current snapshot only when newer."""
+        vendor_key = normalize(vendor) or "unknown vendor"
+        sku = (item.get("sku") or "").strip()
+        name = item["description"].strip()
+        product_key = f"sku:{normalize(sku)}" if sku else f"name:{normalize(name)}"
+        product = c.execute("SELECT * FROM catalog_products WHERE merchant_id=? AND vendor=? AND product_key=?", (merchant, vendor_key, product_key)).fetchone()
+        stamp = now()
+        if product:
+            product_id = product["id"]
+            incoming_is_current = invoice_date_key(effective_date) >= invoice_date_key(product["current_invoice_date"])
+        else:
+            product_id, incoming_is_current = uid("prd"), True
+            c.execute("""INSERT INTO catalog_products(id,merchant_id,vendor,product_key,sku,canonical_name,normalized_name,current_version_id,current_invoice_date,created_at,updated_at)
+                         VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (product_id, merchant, vendor_key, product_key, sku or None, name, normalize(name), None, None, stamp, stamp))
+        version_id = uid("pvr")
+        if incoming_is_current:
+            c.execute("UPDATE product_versions SET is_current=0 WHERE product_id=? AND is_current=1", (product_id,))
+        c.execute("""INSERT INTO product_versions(id,product_id,invoice_id,invoice_line_id,effective_date,quantity,unit,unit_price_cents,line_total_cents,is_current,recorded_at)
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (version_id, product_id, invoice_id, line_id, invoice_date_key(effective_date), item["quantity"], item["unit"], item["unit_price_cents"], item["line_total_cents"], 1 if incoming_is_current else 0, stamp))
+        if incoming_is_current:
+            c.execute("UPDATE catalog_products SET sku=COALESCE(?,sku),canonical_name=?,normalized_name=?,current_version_id=?,current_invoice_date=?,updated_at=? WHERE id=?", (sku or None, name, normalize(name), version_id, invoice_date_key(effective_date), stamp, product_id))
+        self._audit(c, merchant, "product.version_recorded", "catalog_product", product_id, {"version_id": version_id, "invoice_id": invoice_id, "became_current": incoming_is_current, "effective_date": invoice_date_key(effective_date)})
+
+    def product_dashboard(self, merchant):
+        with self.db.connect() as c:
+            rows = c.execute("""SELECT p.id,p.vendor,p.sku,p.canonical_name,p.current_invoice_date,p.created_at,p.updated_at,
+                              v.quantity,v.unit,v.unit_price_cents,v.line_total_cents,
+                              (SELECT COUNT(*) FROM product_versions h WHERE h.product_id=p.id) version_count
+                              FROM catalog_products p LEFT JOIN product_versions v ON v.id=p.current_version_id
+                              WHERE p.merchant_id=? ORDER BY p.canonical_name""", (merchant,)).fetchall()
+        return {"products": [dict(row) for row in rows]}
+
+    def product_history(self, merchant, product_id):
+        with self.db.connect() as c:
+            product = c.execute("SELECT id,vendor,sku,canonical_name,current_invoice_date,created_at,updated_at FROM catalog_products WHERE merchant_id=? AND id=?", (merchant, product_id)).fetchone()
+            if not product: raise KeyError("product not found")
+            versions = c.execute("""SELECT v.id,v.effective_date,v.quantity,v.unit,v.unit_price_cents,v.line_total_cents,v.is_current,v.recorded_at,
+                                  i.external_id invoice_number,i.invoice_date,i.status invoice_status
+                                  FROM product_versions v JOIN invoices i ON i.id=v.invoice_id
+                                  WHERE v.product_id=? ORDER BY v.effective_date DESC,v.recorded_at DESC""", (product_id,)).fetchall()
+        return {"product": dict(product), "history": [dict(row) for row in versions]}
 
     def invoice_dashboard(self, merchant):
         with self.db.connect() as c:
@@ -160,7 +209,11 @@ class OrbitService:
             created = 0
             for item in data.get("items", []):
                 ingredient = normalize(item["ingredient"])
+                line_id = uid("line")
+                line_total = item.get("line_total_cents", round(item["quantity"] * item["unit_cost_cents"]))
+                c.execute("INSERT INTO invoice_lines VALUES(?,?,?,?,?,?,?,?,?)", (line_id, invoice_id, item.get("sku"), item["ingredient"], ingredient, item["quantity"], item["unit"], item["unit_cost_cents"], line_total))
                 c.execute("INSERT INTO inventory_events VALUES(?,?,?,?,?,?,?,?,?)", (uid("ive"), merchant, invoice_id, item["ingredient"], ingredient, item["quantity"], item["unit"], item["unit_cost_cents"], data["invoice_date"]))
+                self._record_product_version(c, merchant, data["vendor"], invoice_id, line_id, data["invoice_date"], {"sku": item.get("sku"), "description": item["ingredient"], "quantity": item["quantity"], "unit": item["unit"], "unit_price_cents": item["unit_cost_cents"], "line_total_cents": line_total})
                 created += self._create_inventory_campaigns(c, merchant, invoice_id, ingredient)
             self._audit(c, merchant, "invoice.processed", "invoice", invoice_id, {"campaigns_created": created})
         return {"id": invoice_id, "duplicate": False, "campaigns_created": created}

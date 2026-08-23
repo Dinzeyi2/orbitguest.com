@@ -18,6 +18,9 @@ without storing raw payment-card data.
 - Extracts invoices through OpenAI into vendor, date, invoice ID, totals, and line items.
 - Stores the original document, extraction confidence, review state, inventory, and price history.
 - Returns a dashboard-ready invoice table and spend summary.
+- Maintains an append-only product price history: newly received products are added,
+  newer invoices update the current snapshot, and late-arriving old invoices are
+  inserted into history without overwriting current values.
 - Finds consented guests whose preferences match newly delivered ingredients.
 - Creates queued campaigns and attributes subsequent orders to those campaigns.
 - Writes an immutable-style audit trail for every sensitive operation.

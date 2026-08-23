@@ -55,6 +55,8 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/v1/campaigns": result = self.service.list_campaigns(merchant)
             elif path == "/v1/metrics": result = self.service.metrics(merchant)
             elif path == "/v1/dashboard/invoices": result = self.service.invoice_dashboard(merchant)
+            elif path == "/v1/dashboard/products": result = self.service.product_dashboard(merchant)
+            elif path.startswith("/v1/products/") and path.endswith("/history"): result = self.service.product_history(merchant, path.split("/")[3])
             else: return self._send(404, {"error": "not_found"})
             self._send(200, result)
         except KeyError as error: self._send(404, {"error": str(error)})
