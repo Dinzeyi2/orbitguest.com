@@ -20,10 +20,20 @@ CREATE TABLE IF NOT EXISTS consents (
  status TEXT NOT NULL, disclosure_version TEXT NOT NULL, source TEXT NOT NULL, captured_at TEXT NOT NULL,
  FOREIGN KEY(guest_id) REFERENCES guests(id), FOREIGN KEY(merchant_id) REFERENCES merchants(id)
 );
+CREATE TABLE IF NOT EXISTS identity_claims (
+ id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, guest_id TEXT NOT NULL,
+ order_id TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, expires_at TEXT NOT NULL,
+ used_at TEXT, created_at TEXT NOT NULL,
+ FOREIGN KEY(merchant_id) REFERENCES merchants(id), FOREIGN KEY(guest_id) REFERENCES guests(id),
+ FOREIGN KEY(order_id) REFERENCES orders(id)
+);
 CREATE TABLE IF NOT EXISTS orders (
  id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, external_id TEXT NOT NULL, guest_id TEXT,
  payment_fingerprint TEXT, occurred_at TEXT NOT NULL, total_cents INTEGER NOT NULL,
  currency TEXT NOT NULL, source TEXT NOT NULL, raw_json TEXT NOT NULL,
+ status TEXT NOT NULL DEFAULT 'completed', location_id TEXT, fulfillment_type TEXT,
+ discount_cents INTEGER NOT NULL DEFAULT 0, is_test INTEGER NOT NULL DEFAULT 0,
+ provider_customer_id TEXT, payment_id TEXT,
  UNIQUE(merchant_id, source, external_id), FOREIGN KEY(guest_id) REFERENCES guests(id)
 );
 CREATE TABLE IF NOT EXISTS pos_connections (
@@ -39,24 +49,26 @@ CREATE TABLE IF NOT EXISTS square_oauth_states (
 );
 CREATE TABLE IF NOT EXISTS square_installations (
  id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL UNIQUE, square_merchant_id TEXT NOT NULL,
+ environment TEXT NOT NULL,
  encrypted_access_token TEXT NOT NULL, encrypted_refresh_token TEXT,
  token_expires_at TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
  FOREIGN KEY(merchant_id) REFERENCES merchants(id)
 );
 CREATE TABLE IF NOT EXISTS square_locations (
  id TEXT PRIMARY KEY, installation_id TEXT NOT NULL, merchant_id TEXT NOT NULL,
+ environment TEXT NOT NULL,
  square_location_id TEXT NOT NULL UNIQUE, name TEXT, timezone TEXT, status TEXT NOT NULL,
  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
  FOREIGN KEY(installation_id) REFERENCES square_installations(id)
 );
 CREATE TABLE IF NOT EXISTS square_webhook_events (
  event_id TEXT PRIMARY KEY, event_type TEXT NOT NULL, square_merchant_id TEXT,
- square_location_id TEXT, payload_json TEXT NOT NULL, status TEXT NOT NULL,
+ square_location_id TEXT, environment TEXT NOT NULL, payload_json TEXT NOT NULL, status TEXT NOT NULL,
  error TEXT, received_at TEXT NOT NULL, processed_at TEXT,
  attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT
 );
 CREATE TABLE IF NOT EXISTS square_sync_state (
- installation_id TEXT PRIMARY KEY, cursor TEXT, last_synced_at TEXT,
+ installation_id TEXT PRIMARY KEY, environment TEXT NOT NULL, cursor TEXT, last_synced_at TEXT,
  status TEXT NOT NULL, error TEXT, FOREIGN KEY(installation_id) REFERENCES square_installations(id)
 );
 CREATE TABLE IF NOT EXISTS refunds (
@@ -67,26 +79,55 @@ CREATE TABLE IF NOT EXISTS refunds (
 );
 CREATE TABLE IF NOT EXISTS order_items (
  id TEXT PRIMARY KEY, order_id TEXT NOT NULL, name TEXT NOT NULL, normalized_name TEXT NOT NULL,
- quantity REAL NOT NULL, unit_price_cents INTEGER NOT NULL, FOREIGN KEY(order_id) REFERENCES orders(id)
+ quantity REAL NOT NULL, unit_price_cents INTEGER NOT NULL, catalog_object_id TEXT,
+ modifiers_json TEXT NOT NULL DEFAULT '[]', FOREIGN KEY(order_id) REFERENCES orders(id)
+);
+CREATE TABLE IF NOT EXISTS guest_identities (
+ id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, guest_id TEXT NOT NULL,
+ identity_type TEXT NOT NULL, identity_value TEXT NOT NULL, verified INTEGER NOT NULL,
+ source TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ UNIQUE(merchant_id,identity_type,identity_value), FOREIGN KEY(guest_id) REFERENCES guests(id)
 );
 CREATE TABLE IF NOT EXISTS behavior_profiles (
  guest_id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, visit_count INTEGER NOT NULL,
  lifetime_spend_cents INTEGER NOT NULL, average_ticket_cents INTEGER NOT NULL,
  first_visit_at TEXT, last_visit_at TEXT, average_interval_days REAL,
  favorite_weekday INTEGER, favorite_hour INTEGER, predicted_next_visit_at TEXT,
- behavior_status TEXT NOT NULL, confidence REAL NOT NULL, updated_at TEXT NOT NULL,
+ behavior_status TEXT NOT NULL, confidence REAL NOT NULL,
+ interval_stddev_days REAL, days_since_last_visit REAL, overdue_by_days REAL,
+ weekday_distribution_json TEXT NOT NULL DEFAULT '{}', hour_distribution_json TEXT NOT NULL DEFAULT '{}',
+ median_ticket_cents INTEGER, return_probabilities_json TEXT NOT NULL DEFAULT '{}',
+ preferred_daypart TEXT, preferred_location_id TEXT, preferred_fulfillment_type TEXT,
+ discount_visit_rate REAL NOT NULL DEFAULT 0,
+ updated_at TEXT NOT NULL,
  FOREIGN KEY(guest_id) REFERENCES guests(id)
 );
 CREATE TABLE IF NOT EXISTS guest_item_affinities (
  guest_id TEXT NOT NULL, normalized_item TEXT NOT NULL, display_name TEXT NOT NULL,
  order_count INTEGER NOT NULL, total_quantity REAL NOT NULL, last_ordered_at TEXT NOT NULL,
+ total_spend_cents INTEGER NOT NULL DEFAULT 0, average_interval_days REAL,
+ preferred_weekday INTEGER, preferred_hour INTEGER, predicted_next_order_at TEXT,
  PRIMARY KEY(guest_id, normalized_item), FOREIGN KEY(guest_id) REFERENCES guests(id)
+);
+CREATE TABLE IF NOT EXISTS guest_item_pairs (
+ guest_id TEXT NOT NULL, first_item TEXT NOT NULL, second_item TEXT NOT NULL,
+ order_count INTEGER NOT NULL, last_ordered_at TEXT NOT NULL,
+ PRIMARY KEY(guest_id,first_item,second_item), FOREIGN KEY(guest_id) REFERENCES guests(id)
+);
+CREATE TABLE IF NOT EXISTS guest_modifier_affinities (
+ guest_id TEXT NOT NULL, modifier_name TEXT NOT NULL, order_count INTEGER NOT NULL,
+ last_ordered_at TEXT NOT NULL, PRIMARY KEY(guest_id,modifier_name),
+ FOREIGN KEY(guest_id) REFERENCES guests(id)
 );
 CREATE TABLE IF NOT EXISTS predictions (
  id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, guest_id TEXT NOT NULL,
  prediction_type TEXT NOT NULL, normalized_item TEXT, score REAL NOT NULL,
  reason TEXT NOT NULL, recommended_channel TEXT, recommended_send_at TEXT,
  status TEXT NOT NULL, trigger_ref TEXT, created_at TEXT NOT NULL,
+ action TEXT NOT NULL DEFAULT 'wait', expected_order_value_cents INTEGER,
+ return_probabilities_json TEXT NOT NULL DEFAULT '{}', time_window_start TEXT,
+ time_window_end TEXT, predicted_basket_json TEXT NOT NULL DEFAULT '[]',
+ do_not_contact INTEGER NOT NULL DEFAULT 0, eligibility_json TEXT NOT NULL DEFAULT '{}',
  UNIQUE(merchant_id,guest_id,prediction_type,normalized_item,trigger_ref),
  FOREIGN KEY(guest_id) REFERENCES guests(id)
 );
@@ -102,6 +143,12 @@ CREATE TABLE IF NOT EXISTS recipe_links (
  confidence REAL NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL,
  UNIQUE(product_id,menu_item_id), FOREIGN KEY(product_id) REFERENCES catalog_products(id),
  FOREIGN KEY(menu_item_id) REFERENCES menu_items(id)
+);
+CREATE TABLE IF NOT EXISTS merchant_operational_state (
+ merchant_id TEXT PRIMARY KEY, accepting_orders INTEGER NOT NULL DEFAULT 1,
+ capacity_remaining INTEGER, preparation_minutes INTEGER,
+ promotions_json TEXT NOT NULL DEFAULT '[]', updated_at TEXT NOT NULL,
+ FOREIGN KEY(merchant_id) REFERENCES merchants(id)
 );
 CREATE TABLE IF NOT EXISTS invoices (
  id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, external_id TEXT NOT NULL, vendor TEXT NOT NULL,
@@ -157,6 +204,8 @@ CREATE TABLE IF NOT EXISTS campaigns (
  id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, guest_id TEXT NOT NULL, channel TEXT NOT NULL,
  trigger_type TEXT NOT NULL, trigger_ref TEXT, subject TEXT, body TEXT NOT NULL,
  status TEXT NOT NULL, scheduled_at TEXT NOT NULL, sent_at TEXT, created_at TEXT NOT NULL,
+ action TEXT NOT NULL DEFAULT 'send_message', control_group INTEGER NOT NULL DEFAULT 0,
+ prediction_window_end TEXT, eligibility_json TEXT NOT NULL DEFAULT '{}',
  FOREIGN KEY(guest_id) REFERENCES guests(id)
 );
 CREATE TABLE IF NOT EXISTS outbound_messages (
@@ -164,6 +213,18 @@ CREATE TABLE IF NOT EXISTS outbound_messages (
  guest_id TEXT NOT NULL, channel TEXT NOT NULL, recipient TEXT NOT NULL,
  provider_message_id TEXT, status TEXT NOT NULL, error TEXT,
  sent_at TEXT, created_at TEXT NOT NULL, FOREIGN KEY(campaign_id) REFERENCES campaigns(id)
+);
+CREATE TABLE IF NOT EXISTS message_events (
+ id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, outbound_message_id TEXT NOT NULL,
+ event_type TEXT NOT NULL, occurred_at TEXT NOT NULL, metadata_json TEXT NOT NULL,
+ UNIQUE(outbound_message_id,event_type,occurred_at), FOREIGN KEY(outbound_message_id) REFERENCES outbound_messages(id)
+);
+CREATE TABLE IF NOT EXISTS campaign_outcomes (
+ campaign_id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, guest_id TEXT NOT NULL,
+ group_name TEXT NOT NULL, converted INTEGER NOT NULL DEFAULT 0, order_id TEXT,
+ revenue_cents INTEGER NOT NULL DEFAULT 0, seconds_to_order INTEGER,
+ unsubscribed INTEGER NOT NULL DEFAULT 0, evaluated_at TEXT,
+ FOREIGN KEY(campaign_id) REFERENCES campaigns(id)
 );
 CREATE TABLE IF NOT EXISTS suppressions (
  merchant_id TEXT NOT NULL, guest_id TEXT NOT NULL, channel TEXT NOT NULL,
@@ -179,8 +240,10 @@ CREATE TABLE IF NOT EXISTS audit_log (
  metadata_json TEXT NOT NULL, created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_orders_guest_time ON orders(merchant_id, guest_id, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_guest_identities ON guest_identities(merchant_id,identity_type,identity_value);
 CREATE INDEX IF NOT EXISTS idx_items_name ON order_items(normalized_name);
 CREATE INDEX IF NOT EXISTS idx_consent_guest ON consents(merchant_id, guest_id, channel, captured_at);
+CREATE INDEX IF NOT EXISTS idx_identity_claim_order ON identity_claims(merchant_id,order_id,expires_at);
 CREATE INDEX IF NOT EXISTS idx_invoice_lines_invoice ON invoice_lines(invoice_id);
 CREATE INDEX IF NOT EXISTS idx_documents_email ON invoice_documents(inbound_email_id);
 CREATE INDEX IF NOT EXISTS idx_products_merchant ON catalog_products(merchant_id, vendor, normalized_name);
@@ -220,10 +283,39 @@ class Database:
             for name, definition in (("profile_status", "TEXT NOT NULL DEFAULT 'anonymous'"), ("terms_version", "TEXT"), ("terms_accepted_at", "TEXT"), ("permission_source", "TEXT")):
                 if name not in guest_columns:
                     connection.execute(f"ALTER TABLE guests ADD COLUMN {name} {definition}")
+            behavior_columns = {row["name"] for row in connection.execute("PRAGMA table_info(behavior_profiles)")}
+            for name, definition in (("interval_stddev_days", "REAL"), ("days_since_last_visit", "REAL"), ("overdue_by_days", "REAL"), ("weekday_distribution_json", "TEXT NOT NULL DEFAULT '{}'"), ("hour_distribution_json", "TEXT NOT NULL DEFAULT '{}'")):
+                if name not in behavior_columns:
+                    connection.execute(f"ALTER TABLE behavior_profiles ADD COLUMN {name} {definition}")
+            affinity_columns = {row["name"] for row in connection.execute("PRAGMA table_info(guest_item_affinities)")}
+            for name, definition in (("total_spend_cents", "INTEGER NOT NULL DEFAULT 0"), ("average_interval_days", "REAL"), ("preferred_weekday", "INTEGER"), ("preferred_hour", "INTEGER"), ("predicted_next_order_at", "TEXT")):
+                if name not in affinity_columns:
+                    connection.execute(f"ALTER TABLE guest_item_affinities ADD COLUMN {name} {definition}")
+            order_columns = {row["name"] for row in connection.execute("PRAGMA table_info(orders)")}
+            for name, definition in (("status", "TEXT NOT NULL DEFAULT 'completed'"), ("location_id", "TEXT"), ("fulfillment_type", "TEXT"), ("discount_cents", "INTEGER NOT NULL DEFAULT 0"), ("is_test", "INTEGER NOT NULL DEFAULT 0"), ("provider_customer_id", "TEXT"), ("payment_id", "TEXT")):
+                if name not in order_columns: connection.execute(f"ALTER TABLE orders ADD COLUMN {name} {definition}")
+            item_columns = {row["name"] for row in connection.execute("PRAGMA table_info(order_items)")}
+            for name, definition in (("catalog_object_id", "TEXT"), ("modifiers_json", "TEXT NOT NULL DEFAULT '[]'")):
+                if name not in item_columns: connection.execute(f"ALTER TABLE order_items ADD COLUMN {name} {definition}")
+            for name, definition in (("median_ticket_cents", "INTEGER"), ("return_probabilities_json", "TEXT NOT NULL DEFAULT '{}'"), ("preferred_daypart", "TEXT"), ("preferred_location_id", "TEXT"), ("preferred_fulfillment_type", "TEXT"), ("discount_visit_rate", "REAL NOT NULL DEFAULT 0")):
+                if name not in behavior_columns: connection.execute(f"ALTER TABLE behavior_profiles ADD COLUMN {name} {definition}")
+            campaign_columns = {row["name"] for row in connection.execute("PRAGMA table_info(campaigns)")}
+            for name, definition in (("action", "TEXT NOT NULL DEFAULT 'send_message'"), ("control_group", "INTEGER NOT NULL DEFAULT 0"), ("prediction_window_end", "TEXT"), ("eligibility_json", "TEXT NOT NULL DEFAULT '{}'")):
+                if name not in campaign_columns: connection.execute(f"ALTER TABLE campaigns ADD COLUMN {name} {definition}")
+            prediction_columns = {row["name"] for row in connection.execute("PRAGMA table_info(predictions)")}
+            for name, definition in (("action", "TEXT NOT NULL DEFAULT 'wait'"), ("expected_order_value_cents", "INTEGER"), ("return_probabilities_json", "TEXT NOT NULL DEFAULT '{}'"), ("time_window_start", "TEXT"), ("time_window_end", "TEXT"), ("predicted_basket_json", "TEXT NOT NULL DEFAULT '[]'"), ("do_not_contact", "INTEGER NOT NULL DEFAULT 0"), ("eligibility_json", "TEXT NOT NULL DEFAULT '{}'")):
+                if name not in prediction_columns: connection.execute(f"ALTER TABLE predictions ADD COLUMN {name} {definition}")
             square_event_columns = {row["name"] for row in connection.execute("PRAGMA table_info(square_webhook_events)")}
             for name, definition in (("attempts", "INTEGER NOT NULL DEFAULT 0"), ("next_attempt_at", "TEXT")):
                 if name not in square_event_columns:
                     connection.execute(f"ALTER TABLE square_webhook_events ADD COLUMN {name} {definition}")
+            for table in ("square_installations", "square_locations", "square_webhook_events", "square_sync_state"):
+                columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+                if "environment" not in columns:
+                    connection.execute(f"ALTER TABLE {table} ADD COLUMN environment TEXT NOT NULL DEFAULT 'legacy'")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_square_install_environment ON square_installations(merchant_id,environment,status)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_square_location_environment ON square_locations(merchant_id,environment,status)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_square_event_environment ON square_webhook_events(environment,status,received_at)")
 
     @contextmanager
     def connect(self):

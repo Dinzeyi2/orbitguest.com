@@ -69,10 +69,22 @@ class SquareIntegration:
         self.redirect_uri = os.getenv("SQUARE_REDIRECT_URI") or f"{self.public_url}/v1/integrations/square/callback"
         self.webhook_url = os.getenv("SQUARE_WEBHOOK_URL") or f"{self.public_url}/v1/webhooks/square"
         self.cipher = cipher
+        self.environment = os.getenv("SQUARE_ENVIRONMENT", "production")
 
     def _cipher(self):
         if not self.cipher: self.cipher = TokenCipher()
         return self.cipher
+
+    def _adopt_legacy_installation(self, merchant):
+        with self.db.connect() as c:
+            legacy = c.execute("SELECT id FROM square_installations WHERE merchant_id=? AND environment='legacy'", (merchant,)).fetchone()
+            if not legacy: return
+            # Keep the encrypted authorization (it may be the merchant's current
+            # production grant), but discard mappings whose source environment
+            # cannot be proven and rebuild them on the next location sync.
+            c.execute("DELETE FROM square_locations WHERE installation_id=?", (legacy["id"],))
+            c.execute("DELETE FROM square_sync_state WHERE installation_id=?", (legacy["id"],))
+            c.execute("UPDATE square_installations SET environment=?,updated_at=? WHERE id=?", (self.environment, utcnow(), legacy["id"]))
 
     def authorize(self, merchant):
         if not self.app_id or not self.public_url: raise SquareError("SQUARE_APPLICATION_ID and PUBLIC_BASE_URL are required")
@@ -93,12 +105,21 @@ class SquareIntegration:
         installation_id, stamp = f"sqi_{secrets.token_hex(16)}", utcnow()
         cipher = self._cipher()
         with self.db.connect() as c:
-            c.execute("""INSERT INTO square_installations VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(merchant_id) DO UPDATE SET square_merchant_id=excluded.square_merchant_id,encrypted_access_token=excluded.encrypted_access_token,encrypted_refresh_token=excluded.encrypted_refresh_token,token_expires_at=excluded.token_expires_at,status='active',updated_at=excluded.updated_at""", (installation_id, row["merchant_id"], token["merchant_id"], cipher.encrypt(token["access_token"]), cipher.encrypt(token["refresh_token"]) if token.get("refresh_token") else None, token.get("expires_at"), "active", stamp, stamp))
+            previous = c.execute("SELECT id,environment FROM square_installations WHERE merchant_id=?", (row["merchant_id"],)).fetchone()
+            if previous and previous["environment"] != self.environment:
+                c.execute("DELETE FROM square_locations WHERE installation_id=?", (previous["id"],))
+                c.execute("DELETE FROM square_sync_state WHERE installation_id=?", (previous["id"],))
+                if previous["environment"] != "legacy":
+                    c.execute("DELETE FROM square_installations WHERE id=?", (previous["id"],))
+            c.execute("""INSERT INTO square_installations(id,merchant_id,square_merchant_id,environment,encrypted_access_token,encrypted_refresh_token,token_expires_at,status,created_at,updated_at)
+                         VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(merchant_id) DO UPDATE SET square_merchant_id=excluded.square_merchant_id,environment=excluded.environment,encrypted_access_token=excluded.encrypted_access_token,encrypted_refresh_token=excluded.encrypted_refresh_token,token_expires_at=excluded.token_expires_at,status='active',updated_at=excluded.updated_at""", (installation_id, row["merchant_id"], token["merchant_id"], self.environment, cipher.encrypt(token["access_token"]), cipher.encrypt(token["refresh_token"]) if token.get("refresh_token") else None, token.get("expires_at"), "active", stamp, stamp))
         self.sync_locations(row["merchant_id"])
         return {"merchant_id": row["merchant_id"], "square_merchant_id": token["merchant_id"], "status": "connected"}
 
     def _installation(self, merchant):
-        with self.db.connect() as c: row = c.execute("SELECT * FROM square_installations WHERE merchant_id=? AND status='active'", (merchant,)).fetchone()
+        self._adopt_legacy_installation(merchant)
+        with self.db.connect() as c:
+            row = c.execute("SELECT * FROM square_installations WHERE merchant_id=? AND environment=? AND status='active'", (merchant, self.environment)).fetchone()
         if not row: raise SquareError("Square is not connected")
         if row["token_expires_at"] and row["token_expires_at"] <= (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat():
             refreshed = SquareClient().refresh(self._cipher().decrypt(row["encrypted_refresh_token"]))
@@ -110,9 +131,17 @@ class SquareIntegration:
         installation, client = self._installation(merchant)
         locations = client.request("GET", "/v2/locations").get("locations", [])
         with self.db.connect() as c:
+            live_ids = {location["id"] for location in locations}
+            c.execute("DELETE FROM square_locations WHERE installation_id=? AND environment<>?", (installation["id"], self.environment))
+            if live_ids:
+                placeholders = ",".join("?" for _ in live_ids)
+                c.execute(f"DELETE FROM square_locations WHERE installation_id=? AND environment=? AND square_location_id NOT IN ({placeholders})", (installation["id"], self.environment, *live_ids))
+            else:
+                c.execute("DELETE FROM square_locations WHERE installation_id=? AND environment=?", (installation["id"], self.environment))
             for location in locations:
                 stamp = utcnow(); location_id = f"sql_{hashlib.sha256(location['id'].encode()).hexdigest()[:24]}"
-                c.execute("""INSERT INTO square_locations VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(square_location_id) DO UPDATE SET name=excluded.name,timezone=excluded.timezone,status=excluded.status,updated_at=excluded.updated_at""", (location_id, installation["id"], merchant, location["id"], location.get("name"), location.get("timezone"), location.get("status", "ACTIVE").lower(), stamp, stamp))
+                c.execute("""INSERT INTO square_locations(id,installation_id,merchant_id,environment,square_location_id,name,timezone,status,created_at,updated_at)
+                             VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(square_location_id) DO UPDATE SET installation_id=excluded.installation_id,merchant_id=excluded.merchant_id,environment=excluded.environment,name=excluded.name,timezone=excluded.timezone,status=excluded.status,updated_at=excluded.updated_at""", (location_id, installation["id"], merchant, self.environment, location["id"], location.get("name"), location.get("timezone"), location.get("status", "ACTIVE").lower(), stamp, stamp))
         return {"locations": len(locations)}
 
     def verify_webhook(self, raw, signature):
@@ -127,8 +156,8 @@ class SquareIntegration:
         with self.db.connect() as c:
             existing = c.execute("SELECT status FROM square_webhook_events WHERE event_id=?", (event_id,)).fetchone()
             if existing: return {"event_id": event_id, "duplicate": True}
-            c.execute("""INSERT INTO square_webhook_events(event_id,event_type,square_merchant_id,square_location_id,payload_json,status,error,received_at,processed_at,attempts,next_attempt_at)
-                         VALUES(?,?,?,?,?,'pending',?,?,NULL,0,?)""", (event_id, event_type, event.get("merchant_id"), location_id, json.dumps(event), None, utcnow(), utcnow()))
+            c.execute("""INSERT INTO square_webhook_events(event_id,event_type,square_merchant_id,square_location_id,environment,payload_json,status,error,received_at,processed_at,attempts,next_attempt_at)
+                         VALUES(?,?,?,?,?,?,'pending',?,?,NULL,0,?)""", (event_id, event_type, event.get("merchant_id"), location_id, self.environment, json.dumps(event), None, utcnow(), utcnow()))
         return {"event_id": event_id, "duplicate": False, "status": "pending"}
 
     def receive_webhook(self, raw):
@@ -143,23 +172,23 @@ class SquareIntegration:
         current = utcnow()
         with self.db.connect() as c:
             if event_id:
-                rows = c.execute("SELECT * FROM square_webhook_events WHERE event_id=? AND status='pending'", (event_id,)).fetchall()
+                rows = c.execute("SELECT * FROM square_webhook_events WHERE event_id=? AND environment=? AND status='pending'", (event_id, self.environment)).fetchall()
             else:
-                rows = c.execute("SELECT * FROM square_webhook_events WHERE status='pending' AND (next_attempt_at IS NULL OR next_attempt_at<=?) ORDER BY received_at LIMIT ?", (current, limit)).fetchall()
+                rows = c.execute("SELECT * FROM square_webhook_events WHERE environment=? AND status='pending' AND (next_attempt_at IS NULL OR next_attempt_at<=?) ORDER BY received_at LIMIT ?", (self.environment, current, limit)).fetchall()
         processed = 0
         for row in rows:
             with self.db.connect() as c:
-                c.execute("UPDATE square_webhook_events SET status='processing',attempts=attempts+1 WHERE event_id=? AND status='pending'", (row["event_id"],))
+                c.execute("UPDATE square_webhook_events SET status='processing',attempts=attempts+1 WHERE event_id=? AND environment=? AND status='pending'", (row["event_id"], self.environment))
                 if not c.execute("SELECT changes()").fetchone()[0]: continue
             try:
                 self._process_event(json.loads(row["payload_json"]))
-                with self.db.connect() as c: c.execute("UPDATE square_webhook_events SET status='processed',error=NULL,processed_at=? WHERE event_id=?", (utcnow(), row["event_id"]))
+                with self.db.connect() as c: c.execute("UPDATE square_webhook_events SET status='processed',error=NULL,processed_at=? WHERE event_id=? AND environment=?", (utcnow(), row["event_id"], self.environment))
                 processed += 1
             except Exception as error:
                 attempts = row["attempts"] + 1
                 retry_at = (datetime.now(timezone.utc) + timedelta(seconds=min(3600, 2 ** min(attempts, 10)))).isoformat()
                 status = "dead" if attempts >= 10 else "pending"
-                with self.db.connect() as c: c.execute("UPDATE square_webhook_events SET status=?,error=?,next_attempt_at=?,processed_at=? WHERE event_id=?", (status, str(error)[:2000], retry_at, utcnow(), row["event_id"]))
+                with self.db.connect() as c: c.execute("UPDATE square_webhook_events SET status=?,error=?,next_attempt_at=?,processed_at=? WHERE event_id=? AND environment=?", (status, str(error)[:2000], retry_at, utcnow(), row["event_id"], self.environment))
         return {"processed": processed, "examined": len(rows)}
 
     def _process_event(self, event):
@@ -167,7 +196,13 @@ class SquareIntegration:
         data = event.get("data", {}); obj = data.get("object", {})
         location_id = (obj.get("order") or obj.get("payment") or {}).get("location_id")
         merchant = self._merchant_for(event.get("merchant_id"), location_id)
-        if event_type.startswith("order."): self._ingest_square_order(merchant, obj["order"])
+        if event_type.startswith("order."):
+            order, payment = obj["order"], None
+            payment_id = next((tender.get("payment_id") for tender in reversed(order.get("tenders", [])) if tender.get("payment_id")), None)
+            if payment_id:
+                installation, client = self._installation(merchant)
+                payment = client.request("GET", f"/v2/payments/{payment_id}").get("payment")
+            self._ingest_square_order(merchant, order, payment)
         elif event_type.startswith("payment.") and obj.get("payment", {}).get("order_id"):
             installation, client = self._installation(merchant)
             order = client.request("GET", f"/v2/orders/{obj['payment']['order_id']}")["order"]
@@ -179,12 +214,13 @@ class SquareIntegration:
             with self.db.connect() as c:
                 order = c.execute("SELECT id FROM orders WHERE merchant_id=? AND source='square' AND external_id=?", (merchant, payment.get("order_id"))).fetchone()
                 c.execute("""INSERT INTO refunds VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(merchant_id,external_id) DO UPDATE SET amount_cents=excluded.amount_cents,status=excluded.status,occurred_at=excluded.occurred_at,raw_json=excluded.raw_json""", (f"ref_{hashlib.sha256(refund['id'].encode()).hexdigest()[:24]}", merchant, refund["id"], order["id"] if order else None, refund.get("amount_money", {}).get("amount", 0), refund.get("amount_money", {}).get("currency", "USD"), refund.get("status", "UNKNOWN"), refund.get("updated_at") or refund.get("created_at") or utcnow(), json.dumps(refund)))
+            if order: self.orbit.refresh_order_behavior(merchant, order["id"])
         elif event_type == "oauth.authorization.revoked":
-            with self.db.connect() as c: c.execute("UPDATE square_installations SET status='revoked',updated_at=? WHERE square_merchant_id=?", (utcnow(), event.get("merchant_id")))
+            with self.db.connect() as c: c.execute("UPDATE square_installations SET status='revoked',updated_at=? WHERE square_merchant_id=? AND environment=?", (utcnow(), event.get("merchant_id"), self.environment))
 
     def recover_interrupted_events(self):
         with self.db.connect() as c:
-            c.execute("UPDATE square_webhook_events SET status='pending',next_attempt_at=? WHERE status='processing'", (utcnow(),))
+            c.execute("UPDATE square_webhook_events SET status='pending',next_attempt_at=? WHERE environment=? AND status='processing'", (utcnow(), self.environment))
 
     def worker_loop(self, stop_event, interval=1.0):
         self.recover_interrupted_events()
@@ -195,23 +231,26 @@ class SquareIntegration:
 
     def _merchant_for(self, square_merchant_id, location_id):
         with self.db.connect() as c:
-            row = c.execute("""SELECT i.merchant_id FROM square_installations i LEFT JOIN square_locations l ON l.installation_id=i.id WHERE i.square_merchant_id=? AND (? IS NULL OR l.square_location_id=?) LIMIT 1""", (square_merchant_id, location_id, location_id)).fetchone()
+            row = c.execute("""SELECT i.merchant_id FROM square_installations i LEFT JOIN square_locations l ON l.installation_id=i.id AND l.environment=i.environment WHERE i.square_merchant_id=? AND i.environment=? AND (? IS NULL OR l.square_location_id=?) LIMIT 1""", (square_merchant_id, self.environment, location_id, location_id)).fetchone()
         if not row: raise SquareError("Square event is not mapped to an Orbit restaurant")
         return row["merchant_id"]
 
     def _ingest_square_order(self, merchant, order, payment=None):
         fingerprint = None
         if payment: fingerprint = payment.get("card_details", {}).get("card", {}).get("fingerprint")
-        fingerprint = fingerprint or (f"square_customer:{order['customer_id']}" if order.get("customer_id") else None)
         items = []
         for line in order.get("line_items", []):
             quantity = float(line.get("quantity", 1)); total = line.get("total_money", {}).get("amount", 0)
-            items.append({"name": line.get("name") or line.get("catalog_object_id") or "Unknown item", "quantity": quantity, "unit_price_cents": round(total / quantity) if quantity else total})
-        return self.orbit.ingest_order(merchant, {"external_id": order["id"], "source": "square", "payment_fingerprint": fingerprint, "occurred_at": order.get("closed_at") or order.get("created_at"), "total_cents": order.get("total_money", {}).get("amount", 0), "currency": order.get("total_money", {}).get("currency", "USD"), "items": items, "square_location_id": order.get("location_id")})
+            modifiers = [{"catalog_object_id": modifier.get("catalog_object_id"), "name": modifier.get("name"), "quantity": modifier.get("quantity", "1"), "amount_cents": modifier.get("total_price_money", {}).get("amount", 0)} for modifier in line.get("modifiers", [])]
+            items.append({"name": line.get("name") or line.get("catalog_object_id") or "Unknown item", "catalog_object_id": line.get("catalog_object_id"), "quantity": quantity, "unit_price_cents": round(total / quantity) if quantity else total, "modifiers": modifiers})
+        fulfillment = next((entry for entry in order.get("fulfillments", []) if entry.get("type")), {})
+        payment_status = payment.get("status") if payment else None
+        status = str(payment_status or order.get("state") or "open").lower()
+        return self.orbit.ingest_order(merchant, {"external_id": order["id"], "source": "square", "provider_customer_id": (payment or {}).get("customer_id") or order.get("customer_id"), "payment_fingerprint": fingerprint, "payment_id": (payment or {}).get("id"), "occurred_at": order.get("closed_at") or (payment or {}).get("created_at") or order.get("created_at"), "total_cents": order.get("total_money", {}).get("amount", (payment or {}).get("amount_money", {}).get("amount", 0)), "currency": order.get("total_money", {}).get("currency", (payment or {}).get("amount_money", {}).get("currency", "USD")), "status": status, "location_id": order.get("location_id") or (payment or {}).get("location_id"), "fulfillment_type": fulfillment.get("type", "DINE_IN" if not order.get("fulfillments") else None), "discount_cents": order.get("total_discount_money", {}).get("amount", 0), "items": items, "tender_ids": [tender.get("id") for tender in order.get("tenders", []) if tender.get("id")]})
 
     def historical_sync(self, merchant, begin_at, end_at=None):
         installation, client = self._installation(merchant)
-        with self.db.connect() as c: locations = [row["square_location_id"] for row in c.execute("SELECT square_location_id FROM square_locations WHERE installation_id=? AND status='active'", (installation["id"],))]
+        with self.db.connect() as c: locations = [row["square_location_id"] for row in c.execute("SELECT square_location_id FROM square_locations WHERE installation_id=? AND environment=? AND status='active'", (installation["id"], self.environment))]
         cursor = None; imported = 0
         while True:
             query = {"location_ids": locations, "query": {"filter": {"date_time_filter": {"created_at": {"start_at": begin_at, **({"end_at": end_at} if end_at else {})}}}, "sort": {"sort_field": "CREATED_AT", "sort_order": "ASC"}}, "limit": 500}
@@ -221,7 +260,7 @@ class SquareIntegration:
             cursor = page.get("cursor")
             if not cursor: break
         payments = self._sync_payments(merchant, client, locations, begin_at, end_at)
-        with self.db.connect() as c: c.execute("INSERT OR REPLACE INTO square_sync_state VALUES(?,?,?,?,?)", (installation["id"], None, utcnow(), "complete", None))
+        with self.db.connect() as c: c.execute("INSERT OR REPLACE INTO square_sync_state(installation_id,environment,cursor,last_synced_at,status,error) VALUES(?,?,?,?,?,?)", (installation["id"], self.environment, None, utcnow(), "complete", None))
         return {"orders_imported": imported, "payments_processed": payments}
 
     def _sync_payments(self, merchant, client, locations, begin_at, end_at):
@@ -236,8 +275,7 @@ class SquareIntegration:
                 for payment in page.get("payments", []):
                     if not payment.get("order_id"): continue
                     fingerprint = payment.get("card_details", {}).get("card", {}).get("fingerprint")
-                    fingerprint = fingerprint or (f"square_customer:{payment['customer_id']}" if payment.get("customer_id") else None)
-                    self.orbit.ingest_order(merchant, {"external_id": payment["order_id"], "source": "square", "payment_fingerprint": fingerprint, "occurred_at": payment.get("created_at"), "total_cents": payment.get("amount_money", {}).get("amount", 0), "currency": payment.get("amount_money", {}).get("currency", "USD"), "items": []})
+                    self.orbit.ingest_order(merchant, {"external_id": payment["order_id"], "source": "square", "provider_customer_id": payment.get("customer_id"), "payment_fingerprint": fingerprint, "payment_id": payment.get("id"), "status": payment.get("status", "unknown").lower(), "location_id": payment.get("location_id"), "occurred_at": payment.get("created_at"), "total_cents": payment.get("amount_money", {}).get("amount", 0), "currency": payment.get("amount_money", {}).get("currency", "USD"), "items": []})
                     processed += 1
                 cursor = page.get("cursor")
                 if not cursor: break
@@ -262,17 +300,20 @@ class SquareIntegration:
         return {"menu_variations_synced": count}
 
     def status(self, merchant):
+        # This also performs the one-time safe migration for an authorization
+        # created before Square environments were recorded.
+        self._adopt_legacy_installation(merchant)
         with self.db.connect() as c:
-            installation = c.execute("SELECT id,square_merchant_id,token_expires_at,status,created_at,updated_at FROM square_installations WHERE merchant_id=?", (merchant,)).fetchone()
+            installation = c.execute("SELECT id,square_merchant_id,environment,token_expires_at,status,created_at,updated_at FROM square_installations WHERE merchant_id=? AND environment=?", (merchant, self.environment)).fetchone()
             if not installation: return {"connected": False}
-            locations = [dict(row) for row in c.execute("SELECT square_location_id,name,timezone,status,updated_at FROM square_locations WHERE merchant_id=? ORDER BY name", (merchant,))]
-            events = dict(c.execute("""SELECT COUNT(*) total_events,SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) pending_events,SUM(CASE WHEN status='dead' THEN 1 ELSE 0 END) dead_events,MAX(processed_at) last_event_at FROM square_webhook_events WHERE square_merchant_id=?""", (installation["square_merchant_id"],)).fetchone())
-            sync = c.execute("SELECT last_synced_at,status,error FROM square_sync_state WHERE installation_id=?", (installation["id"],)).fetchone()
+            locations = [dict(row) for row in c.execute("SELECT square_location_id,name,timezone,status,updated_at FROM square_locations WHERE merchant_id=? AND environment=? ORDER BY name", (merchant, self.environment))]
+            events = dict(c.execute("""SELECT COUNT(*) total_events,SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) pending_events,SUM(CASE WHEN status='dead' THEN 1 ELSE 0 END) dead_events,MAX(processed_at) last_event_at FROM square_webhook_events WHERE square_merchant_id=? AND environment=?""", (installation["square_merchant_id"], self.environment)).fetchone())
+            sync = c.execute("SELECT last_synced_at,status,error FROM square_sync_state WHERE installation_id=? AND environment=?", (installation["id"], self.environment)).fetchone()
         return {"connected": installation["status"] == "active", "installation": dict(installation), "locations": locations, "webhooks": events, "historical_sync": dict(sync) if sync else None}
 
     def retry_event(self, merchant, event_id):
         with self.db.connect() as c:
-            event = c.execute("""SELECT e.event_id FROM square_webhook_events e JOIN square_installations i ON i.square_merchant_id=e.square_merchant_id WHERE e.event_id=? AND i.merchant_id=?""", (event_id, merchant)).fetchone()
+            event = c.execute("""SELECT e.event_id FROM square_webhook_events e JOIN square_installations i ON i.square_merchant_id=e.square_merchant_id AND i.environment=e.environment WHERE e.event_id=? AND i.merchant_id=? AND e.environment=?""", (event_id, merchant, self.environment)).fetchone()
             if not event: raise SquareError("Square event not found")
-            c.execute("UPDATE square_webhook_events SET status='pending',error=NULL,next_attempt_at=? WHERE event_id=?", (utcnow(), event_id))
+            c.execute("UPDATE square_webhook_events SET status='pending',error=NULL,next_attempt_at=? WHERE event_id=? AND environment=?", (utcnow(), event_id, self.environment))
         return {"event_id": event_id, "status": "pending"}

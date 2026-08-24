@@ -24,8 +24,17 @@ without storing raw payment-card data.
 - Automatically creates merchant-scoped anonymous behavior profiles from POS payment
   fingerprints. A customer activates identity and marketing only by providing a phone
   number, accepting a versioned legal disclosure, and granting channel consent.
-- Learns visit frequency, expected next visit, preferred weekday/hour, spend, favorite
-  items, and habit interruptions, then produces permission-gated predictions.
+- Provides short-lived, single-use digital-receipt claim tokens that connect a
+  voluntary phone/terms submission to the exact anonymous POS order profile.
+- Learns robust visit cadence, expected next visit, preferred day/hour distributions,
+  spend, item-level cadence, favorite combinations, and habit interruptions, then
+  produces permission-gated predictions without sending contact details to OpenAI.
+- Joins Square Orders with Payments, prioritizes provider customer IDs over verified
+  merchant-scoped fingerprints, records modifiers/location/fulfillment/discounts, and
+  excludes canceled, test, and fully refunded transactions from visit behavior.
+- Predicts 1/3/7/14-day return probabilities, likely basket/window/value, validates
+  inventory/menu/margin/capacity/cooldown reality, supports an explicit do-nothing
+  decision, and measures incremental lift with randomized control outcomes.
 - Provides configurable POS-location adapters, confirmed ingredient-to-menu recipe
   links, OpenAI next-best-action predictions, real Twilio/Resend delivery, suppression,
   and closed-loop POS revenue attribution.

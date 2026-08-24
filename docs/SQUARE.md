@@ -54,6 +54,23 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
    replayed with `POST /v1/integrations/square/events/{event_id}/retry` after fixing
    the root cause.
 
+## Switching from Sandbox to Production
+
+Set `SQUARE_ENVIRONMENT=production` before generating the Production authorization
+URL. Orbit records the environment on installations, locations, synchronization
+state, and webhook events. Status, catalog and historical synchronization, and the
+webhook worker only use records from the configured environment.
+
+When a restaurant reconnects in Production, Orbit removes its stale Sandbox
+installation, location mappings, and synchronization state before saving the new,
+encrypted Production authorization. Sandbox webhook records remain labelled for
+audit/debugging, but the Production worker never processes them.
+
+For a database created before environment tracking existed, Orbit preserves the
+encrypted authorization and removes only location/sync mappings whose source cannot
+be proven. Run the location sync once afterward to rebuild those mappings from the
+active Square account.
+
 ## Security and reliability
 
 - OAuth state is random, single-use, and expires after ten minutes.
@@ -65,6 +82,15 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 - Access tokens refresh before expiration.
 - Updated orders replace current line-item snapshots without duplicating history;
   refunds are stored separately and deducted from net attributed revenue.
+- Orbit processes both `payment.created` and `payment.updated`. Payment events fetch
+  their associated order so itemization comes from Orders while customer ID, payment
+  ID, status, and card fingerprint come from Payments. Order events with tender payment
+  IDs fetch the Payment before ingestion.
+- Guest resolution prioritizes Square customer ID, then an existing verified
+  fingerprint relationship, then a merchant-scoped anonymous fingerprint. Conflicting
+  customer/card mappings are never silently merged. Apple Pay, replacement cards,
+  shared cards, split tenders, and unidentified payments can therefore remain separate
+  or unidentified until the customer voluntarily claims the profile.
 - Signed webhooks are persisted before acknowledgment. A durable worker resumes
   interrupted events after restart, retries with exponential backoff, and moves an
   event to `dead` after ten failed attempts for operator review.

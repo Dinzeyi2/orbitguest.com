@@ -54,11 +54,27 @@ SMS/email consent. Profiling and permission are separate: Orbit may compute the
 restaurant's operational profile before permission, but it never makes the profile
 contactable or eligible for messaging until permission is recorded.
 
+For a simple website/digital-receipt opt-in without exposing a payment fingerprint:
+
+1. The authenticated restaurant backend calls `POST /v1/identity/claims` with
+   `{"source":"square","external_order_id":"ORDER_ID"}`.
+2. Orbit returns a short-lived, single-use `claim_token` tied to the exact POS order
+   and its existing anonymous guest profile.
+3. The customer-facing website displays the terms and optional channel choices.
+4. If the customer chooses to participate, the website calls the public
+   `POST /v1/identity/claim` with the token, phone number, accepted terms version,
+   and explicit SMS/email consent. Orbit activates only that exact POS profile.
+
+The token expires after 15 minutes by default, is stored only as a SHA-256 hash, and
+cannot be reused. The customer can decline by doing nothing; Orbit never invents or
+looks up their contact information.
+
 `POST /v1/engine/run` recomputes customer rhythms and predictions.
-`GET /v1/dashboard/behaviors` returns visit/spend/frequency/day/time/favorite-item data.
+`GET /v1/dashboard/behaviors` returns visit/spend/frequency, day/hour distributions,
+favorite-item cadence, expected next item order, and frequent item combinations.
 `GET /v1/dashboard/predictions` returns eligible and permission-required opportunities.
 
-## Complete seven-stage engine core
+## Complete behavior decision loop
 
 1. **POS connection:** `POST /v1/pos/connections` registers a restaurant/location and
    returns a one-time `webhook_secret`. Its mapping converts any provider JSON into
@@ -66,19 +82,32 @@ contactable or eligible for messaging until permission is recorded.
    `X-Orbit-POS-Secret`.
 2. **Identity and permission:** POS fingerprints build anonymous histories;
    `/v1/guests/identify` activates contact only after phone, terms, and consent.
-3. **Behavior:** every order refreshes visit rhythm, day/hour, spend, favorite items,
-   expected return, interruption status, and confidence.
+3. **Behavior:** completed, non-test, non-fully-refunded orders refresh robust visit
+   cadence, median/average spend, regularity, daypart/day/hour distributions, location,
+   fulfillment, discount response, item/modifier cadence, combinations, expected return,
+   1/3/7/14-day probabilities, interruption status, and confidence. Canceled, duplicate,
+   test, and fully refunded orders are excluded.
 4. **Recipe intelligence:** `POST /v1/menu/items` stores POS menu items and
    `POST /v1/recipes/links` connects invoice products to menu items. View mappings at
    `GET /v1/dashboard/recipes`.
-5. **OpenAI prediction:** `POST /v1/engine/run` sends profile, affinities, current
-   supplier products, and confirmed menu mappings to OpenAI and queues high-confidence
-   opportunities.
-6. **Delivery:** `POST /v1/campaigns/dispatch` sends due consented campaigns through
+5. **OpenAI prediction:** `POST /v1/engine/run` sends behavioral statistics (never
+   name, phone, or email), affinities, combinations, prior message response, supplier
+   products, estimated inventory, margins, capacity, preparation time, promotions, and
+   confirmed menu mappings to OpenAI. It predicts return windows, basket, order value,
+   and an action including `wait` or `do_nothing`.
+6. **Eligibility/action:** before queuing anything, Orbit rechecks consent, suppression,
+   contact cooldown, menu/recipe mapping, estimated inventory, capacity, and expected
+   incremental profit. `POST /v1/operations/state` supplies capacity, preparation time,
+   and existing promotions. A new order before dispatch makes a campaign stale.
+7. **Delivery:** `POST /v1/campaigns/dispatch` sends due consented campaigns through
    Twilio SMS or Resend email. `POST /v1/guests/{id}/suppress` blocks a channel and
-   records denied consent.
-7. **Attribution:** subsequent POS purchases from the same merchant-scoped profile are
-   linked to the most recent sent campaign and exposed by `/v1/metrics`.
+   records denied consent. `POST /v1/messages/events` records delivered/opened/clicked,
+   failed, bounced, and unsubscribe outcomes.
+8. **Incrementality:** eligible cohorts of at least 20 receive a deterministic randomized
+   holdout controlled by `ORBIT_CONTROL_PERCENT` (default 10%). Purchases inside the
+   prediction window update both messaged and control outcomes; only messaged purchases
+   receive last-touch attribution. `/v1/metrics` reports conversion rates and estimated
+   incremental revenue rather than treating every post-message purchase as caused.
 
 ## Native Square integration
 
