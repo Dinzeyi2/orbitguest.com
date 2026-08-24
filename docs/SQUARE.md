@@ -15,6 +15,10 @@ Create an application in the Square Developer Dashboard and configure:
 Use a separate Square sandbox application and Railway staging service before enabling
 production sellers.
 
+Orbit generates `session=true` for Sandbox OAuth, which Square requires for sandbox
+test-account authorization. Production OAuth uses `session=false`. Always generate a
+new authorization URL after changing environments; OAuth state is single-use.
+
 ## Railway variables
 
 ```text

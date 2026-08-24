@@ -80,7 +80,8 @@ class SquareIntegration:
         expires = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
         with self.db.connect() as c: c.execute("INSERT INTO square_oauth_states VALUES(?,?,?,?,?)", (state, merchant, expires, None, stamp))
         host = "https://connect.squareupsandbox.com" if os.getenv("SQUARE_ENVIRONMENT") == "sandbox" else "https://connect.squareup.com"
-        query = urllib.parse.urlencode({"client_id": self.app_id, "scope": self.SCOPES, "session": "false", "state": state, "redirect_uri": self.redirect_uri})
+        session = "true" if os.getenv("SQUARE_ENVIRONMENT", "production") == "sandbox" else "false"
+        query = urllib.parse.urlencode({"client_id": self.app_id, "scope": self.SCOPES, "session": session, "state": state, "redirect_uri": self.redirect_uri})
         return {"authorization_url": f"{host}/oauth2/authorize?{query}", "expires_at": expires}
 
     def callback(self, code, state):

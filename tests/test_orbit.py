@@ -219,6 +219,7 @@ class OrbitFlowTest(unittest.TestCase):
         with patch.dict(os.environ, {"SQUARE_APPLICATION_ID": "app-id", "SQUARE_APPLICATION_SECRET": "app-secret", "PUBLIC_BASE_URL": "https://orbit.test", "SQUARE_ENVIRONMENT": "sandbox"}):
             square = SquareIntegration(self.service.db, self.service, cipher=FakeCipher())
             authorization = square.authorize(self.merchant)
+            self.assertIn("session=true", authorization["authorization_url"])
             state = authorization["authorization_url"].split("state=")[1].split("&")[0]
             state = __import__("urllib.parse").parse.unquote(state)
             token = {"merchant_id": "sq-merchant", "access_token": "access", "refresh_token": "refresh", "expires_at": "2099-01-01T00:00:00+00:00"}
@@ -230,5 +231,11 @@ class OrbitFlowTest(unittest.TestCase):
         with self.service.db.connect() as c:
             stored = c.execute("SELECT encrypted_access_token FROM square_installations WHERE merchant_id=?", (self.merchant,)).fetchone()
         self.assertEqual(stored["encrypted_access_token"], "encrypted:access")
+
+    def test_square_production_oauth_disables_session(self):
+        with patch.dict(os.environ, {"SQUARE_APPLICATION_ID": "app-id", "PUBLIC_BASE_URL": "https://orbit.test", "SQUARE_ENVIRONMENT": "production"}):
+            square = SquareIntegration(self.service.db, self.service, cipher=object())
+            authorization = square.authorize(self.merchant)
+        self.assertIn("session=false", authorization["authorization_url"])
 
 if __name__ == "__main__": unittest.main()
