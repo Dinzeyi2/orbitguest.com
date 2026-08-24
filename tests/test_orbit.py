@@ -309,7 +309,7 @@ class OrbitFlowTest(unittest.TestCase):
         stamp = "2026-08-01T00:00:00+00:00"
         with self.service.db.connect() as c:
             c.execute("INSERT INTO square_installations VALUES(?,?,?,?,?,?,?,?,?,?)", ("install-1", self.merchant, "square-merchant-1", "production", "token", None, None, "active", stamp, stamp))
-            c.execute("INSERT INTO square_locations VALUES(?,?,?,?,?,?,?,?,?,?)", ("location-1", "install-1", self.merchant, "production", "SQ-LOC-1", "Downtown", "UTC", "active", stamp, stamp))
+            c.execute("INSERT INTO square_locations(id,installation_id,merchant_id,environment,square_merchant_id,verified_at,square_location_id,name,timezone,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", ("location-1", "install-1", self.merchant, "production", "square-merchant-1", stamp, "SQ-LOC-1", "Downtown", "UTC", "active", stamp, stamp))
         event = {"event_id": "square-event-1", "type": "order.updated", "merchant_id": "square-merchant-1", "data": {"object": {"order": {"id": "SQ-ORDER-1", "location_id": "SQ-LOC-1", "customer_id": "SQ-CUSTOMER-1", "state": "COMPLETED", "created_at": "2026-08-01T18:00:00+00:00", "total_money": {"amount": 2400, "currency": "USD"}, "line_items": [{"name": "Rib Plate", "quantity": "1", "total_money": {"amount": 2400, "currency": "USD"}}]}}}}
         raw = json.dumps(event, separators=(",", ":")).encode()
         signature = base64.b64encode(hmac.new(b"square-signing-key", b"https://orbit.test/v1/webhooks/square" + raw, hashlib.sha256).digest()).decode()
@@ -362,7 +362,7 @@ class OrbitFlowTest(unittest.TestCase):
         stamp = "2026-08-01T00:00:00+00:00"
         with self.service.db.connect() as c:
             c.execute("INSERT INTO square_installations VALUES(?,?,?,?,?,?,?,?,?,?)", ("sandbox-install", self.merchant, "sandbox-merchant", "sandbox", "encrypted:sandbox-token", None, None, "active", stamp, stamp))
-            c.execute("INSERT INTO square_locations VALUES(?,?,?,?,?,?,?,?,?,?)", ("sandbox-location", "sandbox-install", self.merchant, "sandbox", "SANDBOX-LOC", "Sandbox Cafe", "UTC", "active", stamp, stamp))
+            c.execute("INSERT INTO square_locations(id,installation_id,merchant_id,environment,square_merchant_id,verified_at,square_location_id,name,timezone,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", ("sandbox-location", "sandbox-install", self.merchant, "sandbox", "sandbox-merchant", stamp, "SANDBOX-LOC", "Sandbox Cafe", "UTC", "active", stamp, stamp))
             c.execute("INSERT INTO square_sync_state VALUES(?,?,?,?,?,?)", ("sandbox-install", "sandbox", None, stamp, "complete", None))
             c.execute("INSERT INTO square_webhook_events VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", ("sandbox-event", "order.created", "sandbox-merchant", "SANDBOX-LOC", "sandbox", "{}", "pending", None, stamp, None, 0, stamp))
 
@@ -381,6 +381,15 @@ class OrbitFlowTest(unittest.TestCase):
             self.assertEqual([location["square_location_id"] for location in status["locations"]], ["PRODUCTION-LOC"])
             self.assertEqual(status["webhooks"]["total_events"], 0)
             self.assertEqual(square.process_pending(), {"processed": 0, "examined": 0})
+            searched = []
+            def production_api(method, path, body=None, *args, **kwargs):
+                if path == "/v2/locations": return {"locations": [{"id": "PRODUCTION-LOC", "name": "Real Restaurant", "timezone": "UTC", "status": "ACTIVE"}]}
+                if path == "/v2/orders/search": searched.append(body["location_ids"]); return {"orders": []}
+                if path.startswith("/v2/payments?"): return {"payments": []}
+                raise AssertionError(path)
+            with patch.object(SquareClient, "request", side_effect=production_api):
+                square.historical_sync(self.merchant, "2026-01-01T00:00:00Z")
+            self.assertEqual(searched, [["PRODUCTION-LOC"]])
 
         with self.service.db.connect() as c:
             installation = c.execute("SELECT environment,encrypted_access_token FROM square_installations WHERE merchant_id=?", (self.merchant,)).fetchone()
@@ -388,6 +397,23 @@ class OrbitFlowTest(unittest.TestCase):
             self.assertEqual(c.execute("SELECT COUNT(*) count FROM square_locations WHERE environment='sandbox'").fetchone()["count"], 0)
             self.assertEqual(c.execute("SELECT COUNT(*) count FROM square_sync_state WHERE environment='sandbox'").fetchone()["count"], 0)
             self.assertEqual(c.execute("SELECT status FROM square_webhook_events WHERE event_id='sandbox-event'").fetchone()["status"], "pending")
+
+    def test_live_production_status_repairs_same_environment_sandbox_contamination(self):
+        class FakeCipher:
+            def decrypt(self, value): return value
+        stamp = "2026-08-20T00:00:00+00:00"
+        with self.service.db.connect() as c:
+            c.execute("INSERT INTO square_installations VALUES(?,?,?,?,?,?,?,?,?,?)", ("prod-install", self.merchant, "PROD-MERCHANT", "production", "production-token", None, None, "active", stamp, stamp))
+            c.execute("INSERT INTO square_locations(id,installation_id,merchant_id,environment,square_merchant_id,verified_at,square_location_id,name,timezone,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", ("prod-location", "prod-install", self.merchant, "production", "PROD-MERCHANT", stamp, "LQB7QYHECNV53", "Orbit", "UTC", "active", stamp, stamp))
+            c.execute("INSERT INTO square_locations(id,installation_id,merchant_id,environment,square_merchant_id,verified_at,square_location_id,name,timezone,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", ("contaminated-location", "prod-install", self.merchant, "production", "SANDBOX-MERCHANT", stamp, "LGH68WD15NM92", "Orbit Test Restaurant", "UTC", "active", stamp, stamp))
+        with patch.dict(os.environ, {"SQUARE_ENVIRONMENT": "production"}), patch.object(SquareClient, "request", return_value={"locations": [{"id": "LQB7QYHECNV53", "name": "Orbit", "timezone": "UTC", "status": "ACTIVE"}]}):
+            status = SquareIntegration(self.service.db, self.service, cipher=FakeCipher()).status(self.merchant)
+        self.assertEqual([row["square_location_id"] for row in status["locations"]], ["LQB7QYHECNV53"])
+        self.assertIsNone(status["location_sync_error"])
+        with self.service.db.connect() as c:
+            self.assertEqual(c.execute("SELECT COUNT(*) count FROM square_locations WHERE square_location_id='LGH68WD15NM92'").fetchone()["count"], 0)
+            token = c.execute("SELECT encrypted_access_token FROM square_installations WHERE merchant_id=?", (self.merchant,)).fetchone()["encrypted_access_token"]
+        self.assertEqual(token, "production-token")
 
     def test_pre_environment_database_preserves_authorization_and_discards_unknown_mappings(self):
         with tempfile.NamedTemporaryFile(suffix=".db") as legacy_file:
@@ -403,11 +429,14 @@ class OrbitFlowTest(unittest.TestCase):
             """)
             connection.commit(); connection.close()
             database = Database(legacy_file.name)
+            class LegacyCipher:
+                def decrypt(self, value): return value
             with patch.dict(os.environ, {"SQUARE_ENVIRONMENT": "production"}):
-                status = SquareIntegration(database, object(), cipher=object()).status("legacy-merchant")
+                with patch.object(SquareClient, "request", return_value={"locations": [{"id": "PROD-LOC", "name": "Production", "status": "ACTIVE"}]}):
+                    status = SquareIntegration(database, object(), cipher=LegacyCipher()).status("legacy-merchant")
             self.assertTrue(status["connected"])
             self.assertEqual(status["installation"]["environment"], "production")
-            self.assertEqual(status["locations"], [])
+            self.assertEqual([row["square_location_id"] for row in status["locations"]], ["PROD-LOC"])
             with database.connect() as c:
                 row = c.execute("SELECT encrypted_access_token FROM square_installations WHERE merchant_id='legacy-merchant'").fetchone()
                 self.assertEqual(row["encrypted_access_token"], "encrypted-production-token")

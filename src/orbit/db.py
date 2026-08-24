@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS square_installations (
 );
 CREATE TABLE IF NOT EXISTS square_locations (
  id TEXT PRIMARY KEY, installation_id TEXT NOT NULL, merchant_id TEXT NOT NULL,
- environment TEXT NOT NULL,
+ environment TEXT NOT NULL, square_merchant_id TEXT, verified_at TEXT,
  square_location_id TEXT NOT NULL UNIQUE, name TEXT, timezone TEXT, status TEXT NOT NULL,
  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
  FOREIGN KEY(installation_id) REFERENCES square_installations(id)
@@ -70,6 +70,9 @@ CREATE TABLE IF NOT EXISTS square_webhook_events (
 CREATE TABLE IF NOT EXISTS square_sync_state (
  installation_id TEXT PRIMARY KEY, environment TEXT NOT NULL, cursor TEXT, last_synced_at TEXT,
  status TEXT NOT NULL, error TEXT, FOREIGN KEY(installation_id) REFERENCES square_installations(id)
+);
+CREATE TABLE IF NOT EXISTS orbit_migrations (
+ name TEXT PRIMARY KEY, applied_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS refunds (
  id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, external_id TEXT NOT NULL,
@@ -313,6 +316,19 @@ class Database:
                 columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
                 if "environment" not in columns:
                     connection.execute(f"ALTER TABLE {table} ADD COLUMN environment TEXT NOT NULL DEFAULT 'legacy'")
+            location_columns = {row["name"] for row in connection.execute("PRAGMA table_info(square_locations)")}
+            square_location_repair = "square_merchant_id" not in location_columns
+            if "square_merchant_id" not in location_columns: connection.execute("ALTER TABLE square_locations ADD COLUMN square_merchant_id TEXT")
+            if "verified_at" not in location_columns: connection.execute("ALTER TABLE square_locations ADD COLUMN verified_at TEXT")
+            if square_location_repair and not connection.execute("SELECT 1 FROM orbit_migrations WHERE name='square_location_provenance_v1'").fetchone():
+                # Existing location rows cannot prove whether they came from Sandbox
+                # or Production. Quarantine them without touching the encrypted,
+                # currently valid installation tokens. The next status/sync refresh
+                # re-verifies the real Production location directly with Square.
+                connection.execute("UPDATE square_locations SET environment='legacy',square_merchant_id=NULL,verified_at=NULL")
+                connection.execute("UPDATE square_sync_state SET environment='legacy'")
+                connection.execute("UPDATE square_webhook_events SET environment='legacy'")
+                connection.execute("INSERT INTO orbit_migrations(name,applied_at) VALUES('square_location_provenance_v1',datetime('now'))")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_square_install_environment ON square_installations(merchant_id,environment,status)")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_square_location_environment ON square_locations(merchant_id,environment,status)")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_square_event_environment ON square_webhook_events(environment,status,received_at)")

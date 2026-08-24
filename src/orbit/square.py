@@ -132,16 +132,19 @@ class SquareIntegration:
         locations = client.request("GET", "/v2/locations").get("locations", [])
         with self.db.connect() as c:
             live_ids = {location["id"] for location in locations}
-            c.execute("DELETE FROM square_locations WHERE installation_id=? AND environment<>?", (installation["id"], self.environment))
+            # The live /v2/locations response from the current encrypted token is the
+            # only authority. Remove Sandbox, legacy, other-installation, and stale
+            # mappings for this Orbit merchant before persisting that response.
+            c.execute("DELETE FROM square_locations WHERE merchant_id=? AND (installation_id<>? OR environment<>? OR square_merchant_id IS NULL OR square_merchant_id<>?)", (merchant, installation["id"], self.environment, installation["square_merchant_id"]))
             if live_ids:
                 placeholders = ",".join("?" for _ in live_ids)
-                c.execute(f"DELETE FROM square_locations WHERE installation_id=? AND environment=? AND square_location_id NOT IN ({placeholders})", (installation["id"], self.environment, *live_ids))
+                c.execute(f"DELETE FROM square_locations WHERE merchant_id=? AND installation_id=? AND environment=? AND square_merchant_id=? AND square_location_id NOT IN ({placeholders})", (merchant, installation["id"], self.environment, installation["square_merchant_id"], *live_ids))
             else:
-                c.execute("DELETE FROM square_locations WHERE installation_id=? AND environment=?", (installation["id"], self.environment))
+                c.execute("DELETE FROM square_locations WHERE merchant_id=? AND installation_id=? AND environment=?", (merchant, installation["id"], self.environment))
             for location in locations:
                 stamp = utcnow(); location_id = f"sql_{hashlib.sha256(location['id'].encode()).hexdigest()[:24]}"
-                c.execute("""INSERT INTO square_locations(id,installation_id,merchant_id,environment,square_location_id,name,timezone,status,created_at,updated_at)
-                             VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(square_location_id) DO UPDATE SET installation_id=excluded.installation_id,merchant_id=excluded.merchant_id,environment=excluded.environment,name=excluded.name,timezone=excluded.timezone,status=excluded.status,updated_at=excluded.updated_at""", (location_id, installation["id"], merchant, self.environment, location["id"], location.get("name"), location.get("timezone"), location.get("status", "ACTIVE").lower(), stamp, stamp))
+                c.execute("""INSERT INTO square_locations(id,installation_id,merchant_id,environment,square_merchant_id,verified_at,square_location_id,name,timezone,status,created_at,updated_at)
+                             VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(square_location_id) DO UPDATE SET installation_id=excluded.installation_id,merchant_id=excluded.merchant_id,environment=excluded.environment,square_merchant_id=excluded.square_merchant_id,verified_at=excluded.verified_at,name=excluded.name,timezone=excluded.timezone,status=excluded.status,updated_at=excluded.updated_at""", (location_id, installation["id"], merchant, self.environment, installation["square_merchant_id"], stamp, location["id"], location.get("name"), location.get("timezone"), location.get("status", "ACTIVE").lower(), stamp, stamp))
         return {"locations": len(locations)}
 
     def verify_webhook(self, raw, signature):
@@ -231,7 +234,7 @@ class SquareIntegration:
 
     def _merchant_for(self, square_merchant_id, location_id):
         with self.db.connect() as c:
-            row = c.execute("""SELECT i.merchant_id FROM square_installations i LEFT JOIN square_locations l ON l.installation_id=i.id AND l.environment=i.environment WHERE i.square_merchant_id=? AND i.environment=? AND (? IS NULL OR l.square_location_id=?) LIMIT 1""", (square_merchant_id, self.environment, location_id, location_id)).fetchone()
+            row = c.execute("""SELECT i.merchant_id FROM square_installations i LEFT JOIN square_locations l ON l.installation_id=i.id AND l.environment=i.environment AND l.square_merchant_id=i.square_merchant_id AND l.verified_at IS NOT NULL WHERE i.square_merchant_id=? AND i.environment=? AND (? IS NULL OR l.square_location_id=?) LIMIT 1""", (square_merchant_id, self.environment, location_id, location_id)).fetchone()
         if not row: raise SquareError("Square event is not mapped to an Orbit restaurant")
         return row["merchant_id"]
 
@@ -249,8 +252,12 @@ class SquareIntegration:
         return self.orbit.ingest_order(merchant, {"external_id": order["id"], "source": "square", "provider_customer_id": (payment or {}).get("customer_id") or order.get("customer_id"), "payment_fingerprint": fingerprint, "payment_id": (payment or {}).get("id"), "occurred_at": order.get("closed_at") or (payment or {}).get("created_at") or order.get("created_at"), "total_cents": order.get("total_money", {}).get("amount", (payment or {}).get("amount_money", {}).get("amount", 0)), "currency": order.get("total_money", {}).get("currency", (payment or {}).get("amount_money", {}).get("currency", "USD")), "status": status, "location_id": order.get("location_id") or (payment or {}).get("location_id"), "fulfillment_type": fulfillment.get("type", "DINE_IN" if not order.get("fulfillments") else None), "discount_cents": order.get("total_discount_money", {}).get("amount", 0), "items": items, "tender_ids": [tender.get("id") for tender in order.get("tenders", []) if tender.get("id")]})
 
     def historical_sync(self, merchant, begin_at, end_at=None):
+        # Reconcile against the live Production authorization immediately before
+        # constructing the search request. Never trust cached location IDs here.
+        self.sync_locations(merchant)
         installation, client = self._installation(merchant)
-        with self.db.connect() as c: locations = [row["square_location_id"] for row in c.execute("SELECT square_location_id FROM square_locations WHERE installation_id=? AND environment=? AND status='active'", (installation["id"], self.environment))]
+        with self.db.connect() as c: locations = [row["square_location_id"] for row in c.execute("SELECT square_location_id FROM square_locations WHERE installation_id=? AND merchant_id=? AND environment=? AND square_merchant_id=? AND verified_at IS NOT NULL AND status='active'", (installation["id"], merchant, self.environment, installation["square_merchant_id"]))]
+        if not locations: raise SquareError(f"No verified {self.environment} Square locations are available")
         cursor = None; imported = 0
         while True:
             query = {"location_ids": locations, "query": {"filter": {"date_time_filter": {"created_at": {"start_at": begin_at, **({"end_at": end_at} if end_at else {})}}}, "sort": {"sort_field": "CREATED_AT", "sort_order": "ASC"}}, "limit": 500}
@@ -303,13 +310,20 @@ class SquareIntegration:
         # This also performs the one-time safe migration for an authorization
         # created before Square environments were recorded.
         self._adopt_legacy_installation(merchant)
+        location_sync_error = None
         with self.db.connect() as c:
             installation = c.execute("SELECT id,square_merchant_id,environment,token_expires_at,status,created_at,updated_at FROM square_installations WHERE merchant_id=? AND environment=?", (merchant, self.environment)).fetchone()
             if not installation: return {"connected": False}
-            locations = [dict(row) for row in c.execute("SELECT square_location_id,name,timezone,status,updated_at FROM square_locations WHERE merchant_id=? AND environment=? ORDER BY name", (merchant, self.environment))]
+            needs_reconciliation = c.execute("SELECT 1 FROM square_locations WHERE merchant_id=? AND (environment<>? OR square_merchant_id IS NULL OR square_merchant_id<>? OR verified_at IS NULL) LIMIT 1", (merchant, self.environment, installation["square_merchant_id"])).fetchone()
+            verified = c.execute("SELECT 1 FROM square_locations WHERE merchant_id=? AND installation_id=? AND environment=? AND square_merchant_id=? AND verified_at IS NOT NULL LIMIT 1", (merchant, installation["id"], self.environment, installation["square_merchant_id"])).fetchone()
+        if needs_reconciliation or not verified:
+            try: self.sync_locations(merchant)
+            except SquareError as error: location_sync_error = str(error)
+        with self.db.connect() as c:
+            locations = [dict(row) for row in c.execute("SELECT square_location_id,name,timezone,status,updated_at,verified_at FROM square_locations WHERE merchant_id=? AND installation_id=? AND environment=? AND square_merchant_id=? AND verified_at IS NOT NULL ORDER BY name", (merchant, installation["id"], self.environment, installation["square_merchant_id"]))]
             events = dict(c.execute("""SELECT COUNT(*) total_events,SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) pending_events,SUM(CASE WHEN status='dead' THEN 1 ELSE 0 END) dead_events,MAX(processed_at) last_event_at FROM square_webhook_events WHERE square_merchant_id=? AND environment=?""", (installation["square_merchant_id"], self.environment)).fetchone())
             sync = c.execute("SELECT last_synced_at,status,error FROM square_sync_state WHERE installation_id=? AND environment=?", (installation["id"], self.environment)).fetchone()
-        return {"connected": installation["status"] == "active", "installation": dict(installation), "locations": locations, "webhooks": events, "historical_sync": dict(sync) if sync else None}
+        return {"connected": installation["status"] == "active", "installation": dict(installation), "locations": locations, "location_sync_error": location_sync_error, "webhooks": events, "historical_sync": dict(sync) if sync else None}
 
     def retry_event(self, merchant, event_id):
         with self.db.connect() as c:

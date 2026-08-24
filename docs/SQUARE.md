@@ -71,6 +71,14 @@ encrypted authorization and removes only location/sync mappings whose source can
 be proven. Run the location sync once afterward to rebuild those mappings from the
 active Square account.
 
+The `square_location_provenance_v1` database migration also repairs deployments where
+Sandbox and Production rows were previously labelled alike. It quarantines unverified
+cached locations and sync state without changing encrypted Production tokens. The next
+status request or historical sync calls Square's live `/v2/locations` endpoint, stamps
+each returned location with the current environment and Square merchant ID, and removes
+every stale mapping. Historical order/payment synchronization refuses to start unless
+at least one location has been verified by the current authorization.
+
 ## Security and reliability
 
 - OAuth state is random, single-use, and expires after ten minutes.
