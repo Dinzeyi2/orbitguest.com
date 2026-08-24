@@ -12,6 +12,7 @@ from .resend import ResendInboundClient, ResendError
 from .prediction import OpenAIBehaviorPredictor
 from .messaging import MessageDelivery
 from .square import SquareIntegration, SquareError
+from .demo import BehaviorDemoSeeder, DemoSeedError
 
 class Handler(BaseHTTPRequestHandler):
     service = None
@@ -69,10 +70,11 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/v1/engine/run": result = self.service.run_behavior_engine(merchant)
             elif path == "/v1/campaigns/dispatch": result = self.service.dispatch_campaigns(merchant, data.get("limit", 100))
             elif path == "/v1/messages/events": result = self.service.record_message_event(merchant, data)
+            elif path == "/v1/demo/behavior/seed": result = BehaviorDemoSeeder(self.service).seed(merchant)
             elif path.startswith("/v1/guests/") and path.endswith("/suppress"): result = self.service.suppress(merchant, path.split("/")[3], data["channel"], data.get("reason", "customer_opt_out"))
             else: return self._send(404, {"error": "not_found"})
             self._send(200, result)
-        except (KeyError, ValueError, SquareError) as error: self._send(400, {"error": str(error)})
+        except (KeyError, ValueError, SquareError, DemoSeedError) as error: self._send(400, {"error": str(error)})
         except Exception: self._send(500, {"error": "internal_error"})
     def do_GET(self):
         parsed = urlparse(self.path); path, merchant = parsed.path, self._merchant()

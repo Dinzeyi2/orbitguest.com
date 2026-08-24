@@ -7,6 +7,7 @@ from orbit.db import Database
 from orbit.service import OrbitService
 from orbit.resend import ResendInboundClient
 from orbit.square import SquareIntegration, SquareClient
+from orbit.demo import BehaviorDemoSeeder, DemoSeedError
 import hashlib
 import hmac
 import json
@@ -447,5 +448,42 @@ class OrbitFlowTest(unittest.TestCase):
         self.assertIn("cryptography>=43,<47", requirements)
         start = (Path(__file__).parents[1] / "Procfile").read_text()
         self.assertIn("python scripts/check_runtime.py", start)
+
+    def test_behavior_demo_seeder_is_sandbox_only_and_builds_realistic_profiles(self):
+        seeder = BehaviorDemoSeeder(self.service)
+        with patch.dict(os.environ, {"SQUARE_ENVIRONMENT": "production", "ORBIT_DEMO_MODE": "true"}):
+            with self.assertRaises(DemoSeedError): seeder.seed(self.merchant)
+        with patch.dict(os.environ, {"SQUARE_ENVIRONMENT": "sandbox", "ORBIT_DEMO_MODE": "false"}):
+            with self.assertRaises(DemoSeedError): seeder.seed(self.merchant)
+        protected = self.service.create_merchant("Production Protected")["id"]
+        stamp = "2026-08-01T00:00:00+00:00"
+        with self.service.db.connect() as connection:
+            connection.execute("INSERT INTO square_installations VALUES(?,?,?,?,?,?,?,?,?,?)", ("protected-install", protected, "protected-square", "production", "token", None, None, "active", stamp, stamp))
+        with patch.dict(os.environ, {"SQUARE_ENVIRONMENT": "sandbox", "ORBIT_DEMO_MODE": "true"}):
+            with self.assertRaises(DemoSeedError): seeder.seed(protected)
+        self.service.predictor = FakePredictor()
+        with patch.dict(os.environ, {"SQUARE_ENVIRONMENT": "sandbox", "ORBIT_DEMO_MODE": "true"}):
+            result = seeder.seed(self.merchant)
+        self.assertGreaterEqual(result["profiles"]["profile_count"], 14)
+        self.assertEqual(len(result["created_profiles"]), 14)
+        self.assertGreaterEqual(result["profiles"]["profile_count"] - result["profiles"]["identified_count"], 10)
+        self.assertGreater(result["orders_created"], 50)
+        self.assertEqual(result["canceled_orders"], 1)
+        self.assertEqual(result["fully_refunded_orders"], 1)
+        self.assertEqual(result["ribs_regular"]["visit_count"], 7)
+        self.assertAlmostEqual(result["ribs_regular"]["average_interval_days"], 14, places=1)
+        self.assertEqual(result["ribs_regular"]["favorite_item"], "Smoked Ribs")
+        self.assertTrue(result["expected_predictions"])
+        with self.service.db.connect() as connection:
+            canceled = connection.execute("SELECT status FROM orders WHERE external_id='demo-canceled'").fetchone()
+            modifiers = connection.execute("SELECT COUNT(*) count FROM order_items WHERE modifiers_json<>'[]'").fetchone()["count"]
+            locations = connection.execute("SELECT COUNT(DISTINCT location_id) count FROM orders WHERE external_id LIKE 'demo-%'").fetchone()["count"]
+            fulfillments = connection.execute("SELECT COUNT(DISTINCT fulfillment_type) count FROM orders WHERE external_id LIKE 'demo-%'").fetchone()["count"]
+            discounts = connection.execute("SELECT COUNT(*) count FROM orders WHERE external_id LIKE 'demo-%' AND discount_cents>0").fetchone()["count"]
+        self.assertEqual(canceled["status"], "canceled")
+        self.assertGreater(modifiers, 0)
+        self.assertGreaterEqual(locations, 2)
+        self.assertGreaterEqual(fulfillments, 3)
+        self.assertGreater(discounts, 0)
 
 if __name__ == "__main__": unittest.main()

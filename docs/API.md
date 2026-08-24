@@ -117,6 +117,13 @@ pagination, signed webhook verification, event idempotency, explicit tenant/loca
 mapping, card-fingerprint enrichment, and retry handling. Setup is documented in
 [`docs/SQUARE.md`](SQUARE.md).
 
+## Sandbox demo data
+
+Authenticated `POST /v1/demo/behavior/seed` creates a realistic 90-day POS dataset,
+runs the behavior engine, and returns profiles plus expected predictions. It refuses
+unless `SQUARE_ENVIRONMENT=sandbox` and `ORBIT_DEMO_MODE=true`, and it rejects any
+merchant with an active Production Square installation. See [`docs/DEMO.md`](DEMO.md).
+
 The current service preserves files on `ORBIT_STORAGE_DIR`, records extraction
 confidence, and routes confidence below 0.75 to `needs_review`. Add malware scanning
 and object-storage encryption before accepting untrusted production attachments.

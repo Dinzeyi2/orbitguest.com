@@ -55,6 +55,7 @@ Create a merchant, then use the returned `api_key` as `Authorization: Bearer ...
 See [`docs/API.md`](docs/API.md) for the complete workflow.
 See [`docs/RAILWAY.md`](docs/RAILWAY.md) for Railway and email-domain setup.
 See [`docs/SQUARE.md`](docs/SQUARE.md) for the first native production POS integration.
+See [`docs/DEMO.md`](docs/DEMO.md) for the strictly Sandbox-only behavior demo seeder.
 
 For live email, configure Resend to send `email.received` events to
 `/v1/webhooks/resend`, then set `RESEND_API_KEY` and `RESEND_WEBHOOK_SECRET`.

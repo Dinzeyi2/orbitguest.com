@@ -82,3 +82,6 @@ python scripts/send_test_invoice.py /path/to/real-invoice.pdf
 A successful response has `"status": "processed"` and an `invoice_id`. This tests
 Railway storage, webhook security, OpenAI extraction, and database persistence. It
 simulates the inbound provider; connecting Resend or another provider is the next step.
+
+For staging behavior demonstrations only, follow `docs/DEMO.md`. Never configure
+`ORBIT_DEMO_MODE=true` on the Production Railway service.
