@@ -238,4 +238,10 @@ class OrbitFlowTest(unittest.TestCase):
             authorization = square.authorize(self.merchant)
         self.assertIn("session=false", authorization["authorization_url"])
 
+    def test_railway_declares_cryptography_runtime_dependency(self):
+        requirements = (Path(__file__).parents[1] / "requirements.txt").read_text()
+        self.assertIn("cryptography>=43,<47", requirements)
+        start = (Path(__file__).parents[1] / "Procfile").read_text()
+        self.assertIn("python scripts/check_runtime.py", start)
+
 if __name__ == "__main__": unittest.main()

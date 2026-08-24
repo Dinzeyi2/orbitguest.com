@@ -23,6 +23,11 @@
 5. Redeploy. Railway uses the included start command, its injected `PORT`, and the
    `/health` endpoint.
 
+Railway installs `requirements.txt`, which includes `cryptography`. Before Orbit starts,
+`scripts/check_runtime.py` imports Fernet, validates `TOKEN_ENCRYPTION_KEY` when Square
+is configured, and performs an encryption/decryption round trip. A missing dependency
+now fails the deployment immediately instead of breaking the OAuth callback later.
+
 The previous start command always used `/data/orbit.db`. Railway failed when `/data`
 did not exist because no volume was mounted. The application now creates database
 directories automatically and starts from a writable `/tmp` default when the volume
