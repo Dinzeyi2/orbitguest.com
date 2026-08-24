@@ -21,6 +21,14 @@ without storing raw payment-card data.
 - Maintains an append-only product price history: newly received products are added,
   newer invoices update the current snapshot, and late-arriving old invoices are
   inserted into history without overwriting current values.
+- Automatically creates merchant-scoped anonymous behavior profiles from POS payment
+  fingerprints. A customer activates identity and marketing only by providing a phone
+  number, accepting a versioned legal disclosure, and granting channel consent.
+- Learns visit frequency, expected next visit, preferred weekday/hour, spend, favorite
+  items, and habit interruptions, then produces permission-gated predictions.
+- Provides configurable POS-location adapters, confirmed ingredient-to-menu recipe
+  links, OpenAI next-best-action predictions, real Twilio/Resend delivery, suppression,
+  and closed-loop POS revenue attribution.
 - Finds consented guests whose preferences match newly delivered ingredients.
 - Creates queued campaigns and attributes subsequent orders to those campaigns.
 - Writes an immutable-style audit trail for every sensitive operation.
@@ -37,6 +45,7 @@ OPENAI_API_KEY=... INBOUND_EMAIL_SECRET=... PYTHONPATH=src python -m orbit.api
 Create a merchant, then use the returned `api_key` as `Authorization: Bearer ...`.
 See [`docs/API.md`](docs/API.md) for the complete workflow.
 See [`docs/RAILWAY.md`](docs/RAILWAY.md) for Railway and email-domain setup.
+See [`docs/SQUARE.md`](docs/SQUARE.md) for the first native production POS integration.
 
 For live email, configure Resend to send `email.received` events to
 `/v1/webhooks/resend`, then set `RESEND_API_KEY` and `RESEND_WEBHOOK_SECRET`.

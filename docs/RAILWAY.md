@@ -14,6 +14,12 @@
    - `OPENAI_INVOICE_MODEL=gpt-4.1-mini`
    - `RESEND_API_KEY=<your Resend API key>`
    - `RESEND_WEBHOOK_SECRET=<the whsec_ value from the Resend webhook>`
+   - `OPENAI_PREDICTION_MODEL=gpt-4.1-mini`
+   - `ORBIT_EMAIL_FROM=Orbit <messages@your-verified-domain>`
+   - `TWILIO_ACCOUNT_SID=<your Twilio account SID>`
+   - `TWILIO_AUTH_TOKEN=<your Twilio auth token>`
+   - `TWILIO_FROM_NUMBER=<your Twilio sending number>`
+   - Square variables listed in [`docs/SQUARE.md`](SQUARE.md)
 5. Redeploy. Railway uses the included start command, its injected `PORT`, and the
    `/health` endpoint.
 
