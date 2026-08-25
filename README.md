@@ -56,6 +56,8 @@ See [`docs/API.md`](docs/API.md) for the complete workflow.
 See [`docs/RAILWAY.md`](docs/RAILWAY.md) for Railway and email-domain setup.
 See [`docs/SQUARE.md`](docs/SQUARE.md) for the first native production POS integration.
 See [`docs/DEMO.md`](docs/DEMO.md) for the strictly Sandbox-only behavior demo seeder.
+See [`docs/INTELLIGENCE.md`](docs/INTELLIGENCE.md) for recipe/inventory guardrails,
+prediction responsibilities, approvals, and evaluations.
 
 For live email, configure Resend to send `email.received` events to
 `/v1/webhooks/resend`, then set `RESEND_API_KEY` and `RESEND_WEBHOOK_SECRET`.

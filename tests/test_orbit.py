@@ -8,12 +8,14 @@ from orbit.service import OrbitService
 from orbit.resend import ResendInboundClient
 from orbit.square import SquareIntegration, SquareClient
 from orbit.demo import BehaviorDemoSeeder, DemoSeedError
+from orbit.prediction import OpenAIBehaviorPredictor
 import hashlib
 import hmac
 import json
 import time
 import os
 import sqlite3
+import urllib.error
 from unittest.mock import patch
 
 class FakeExtractor:
@@ -63,9 +65,10 @@ class OrbitFlowTest(unittest.TestCase):
         return self.service.ingest_order(self.merchant, {"external_id": external, "source": "square", "payment_fingerprint": "tok_guest_1", "occurred_at": when, "total_cents": 3200, "items": [{"name": "Smoked Ribs", "quantity": 1, "unit_price_cents": 3200}]})
 
     def test_closed_loop_from_pos_to_invoice_campaign_and_revenue(self):
-        self.order("order-1"); self.order("order-2")
+        for index, stamp in enumerate(("2026-05-18", "2026-06-01", "2026-06-15", "2026-06-29", "2026-07-13", "2026-07-27", "2026-08-10")):
+            self.order(f"order-{index}", f"{stamp}T18:00:00+00:00")
         profile = self.service.capture_identity(self.merchant, {"payment_fingerprint": "tok_guest_1", "name": "Jamie", "phone": "+15550001111", "terms": {"accepted": True, "version": "terms-v1"}, "consent": {"sms": {"status": "granted", "disclosure_version": "v1"}}})
-        self.assertEqual(profile["visits"], 2)
+        self.assertEqual(profile["visits"], 7)
         invoice = self.service.ingest_invoice(self.merchant, {"external_id": "invoice-1", "vendor": "Foods Co", "invoice_date": "2026-08-20T10:00:00+00:00", "total_cents": 10000, "items": [{"ingredient": "Ribs", "quantity": 40, "unit": "case", "unit_cost_cents": 250}]})
         self.assertEqual(invoice["campaigns_created"], 0)
         product = self.service.product_dashboard(self.merchant)["products"][0]
@@ -77,8 +80,9 @@ class OrbitFlowTest(unittest.TestCase):
         inventory_prediction = self.service.prediction_dashboard(self.merchant)["predictions"][0]
         self.assertEqual(inventory_prediction["prediction_type"], "next_visit")
         self.assertEqual(inventory_prediction["status"], "eligible")
+        self.service.approve_campaign(self.merchant, campaign["id"])
         self.service.mark_sent(self.merchant, campaign["id"])
-        self.order("order-3", datetime.now(timezone.utc).isoformat())
+        self.order("order-return", datetime.now(timezone.utc).isoformat())
         self.assertEqual(self.service.metrics(self.merchant)["revenue_cents"], 3200)
 
     def test_opted_out_guest_is_not_messaged(self):
@@ -287,7 +291,8 @@ class OrbitFlowTest(unittest.TestCase):
         self.assertEqual(customer["favorite_item"], "Chicken Bowl")
 
     def test_recipe_mapping_openai_prediction_delivery_and_suppression(self):
-        self.order("engine-1", "2026-06-01T18:00:00+00:00"); self.order("engine-2", "2026-06-15T18:00:00+00:00")
+        for index, stamp in enumerate(("2026-05-18", "2026-06-01", "2026-06-15", "2026-06-29", "2026-07-13", "2026-07-27", "2026-08-10")):
+            self.order(f"engine-{index}", f"{stamp}T18:00:00+00:00")
         profile = self.service.capture_identity(self.merchant, {"payment_fingerprint": "tok_guest_1", "phone": "+15550001", "terms": {"accepted": True, "version": "v1"}, "consent": {"sms": {"status": "granted", "disclosure_version": "v1"}}})
         self.service.ingest_invoice(self.merchant, {"external_id": "recipe-invoice", "vendor": "Foods", "invoice_date": "2026-07-01", "total_cents": 100, "items": [{"sku": "RIB", "ingredient": "Ribs", "quantity": 10, "unit": "case", "unit_cost_cents": 10}]})
         product = self.service.product_dashboard(self.merchant)["products"][0]
@@ -296,6 +301,8 @@ class OrbitFlowTest(unittest.TestCase):
         self.assertEqual(len(self.service.recipe_dashboard(self.merchant)["recipe_links"]), 1)
         delivery = FakeDelivery(); self.service.predictor = FakePredictor(); self.service.delivery = delivery
         self.service.run_behavior_engine(self.merchant)
+        campaign = self.service.list_campaigns(self.merchant)[0]
+        self.service.approve_campaign(self.merchant, campaign["id"])
         dispatched = self.service.dispatch_campaigns(self.merchant)
         self.assertEqual(dispatched["messages"][0]["status"], "sent")
         self.assertEqual(delivery.sent[0][0], "sms")
@@ -485,5 +492,64 @@ class OrbitFlowTest(unittest.TestCase):
         self.assertGreaterEqual(locations, 2)
         self.assertGreaterEqual(fulfillments, 3)
         self.assertGreater(discounts, 0)
+
+    def test_recipe_inventory_reconciles_sales_refunds_waste_and_margin(self):
+        invoice = self.service.ingest_invoice(self.merchant, {"external_id": "stock-1", "vendor": "Butcher", "invoice_date": "2026-07-01", "total_cents": 90000, "items": [{"sku": "RIB", "ingredient": "Ribs", "quantity": 100, "unit": "lb", "unit_cost_cents": 900, "line_total_cents": 90000}]})
+        self.assertFalse(invoice["duplicate"])
+        product = self.service.product_dashboard(self.merchant)["products"][0]
+        menu = self.service.upsert_menu_item(self.merchant, {"external_id": "rib-plate", "name": "Rib Plate", "price_cents": 3200})
+        self.service.link_recipe(self.merchant, {"product_id": product["id"], "menu_item_id": menu["id"], "quantity_required": .75, "unit": "lb", "waste_percent": 10, "yield_percent": 90, "packaging_cost_cents": 100})
+        for index in range(20):
+            self.service.ingest_order(self.merchant, {"external_id": f"stock-sale-{index}", "source": "square", "payment_fingerprint": f"stock-{index}", "occurred_at": f"2026-07-{index+2:02d}T18:00:00+00:00", "total_cents": 3200, "status": "completed", "items": [{"name": "Rib Plate", "catalog_object_id": "rib-plate", "quantity": 1, "unit_price_cents": 3200}]})
+        canceled = self.service.ingest_order(self.merchant, {"external_id": "stock-canceled", "source": "square", "payment_fingerprint": "stock-x", "occurred_at": "2026-07-25T18:00:00+00:00", "total_cents": 3200, "status": "canceled", "items": [{"name": "Rib Plate", "catalog_object_id": "rib-plate", "quantity": 1, "unit_price_cents": 3200}]})
+        refunded = self.service.ingest_order(self.merchant, {"external_id": "stock-refunded", "source": "square", "payment_fingerprint": "stock-y", "occurred_at": "2026-07-26T18:00:00+00:00", "total_cents": 3200, "status": "completed", "items": [{"name": "Rib Plate", "catalog_object_id": "rib-plate", "quantity": 1, "unit_price_cents": 3200}]})
+        with self.service.db.connect() as connection:
+            connection.execute("INSERT INTO refunds VALUES(?,?,?,?,?,?,?,?,?)", ("refund-stock", self.merchant, "refund-stock", refunded["id"], 3200, "USD", "COMPLETED", "2026-07-27T00:00:00+00:00", "{}"))
+        dashboard = self.service.inventory_dashboard(self.merchant)
+        ribs = dashboard["ingredients"][0]; plate = dashboard["menu_items"][0]
+        self.assertAlmostEqual(ribs["estimated_quantity"], 81.667, places=3)
+        self.assertEqual(plate["estimated_portions"], 89)
+        self.assertEqual(plate["status"], "safe_to_promote")
+        self.assertEqual(plate["estimated_contribution_margin_cents"], 2275)
+        self.service.adjust_inventory(self.merchant, {"product_id": product["id"], "quantity": 5, "unit": "lb", "reason": "spoilage"})
+        self.assertAlmostEqual(self.service.inventory_dashboard(self.merchant)["ingredients"][0]["estimated_quantity"], 76.667, places=3)
+        self.service.adjust_inventory(self.merchant, {"product_id": product["id"], "quantity": 50, "unit": "lb", "reason": "count"})
+        self.assertEqual(self.service.inventory_dashboard(self.merchant)["ingredients"][0]["estimated_quantity"], 50)
+        with self.service.db.connect() as connection:
+            consumed_orders = connection.execute("SELECT COUNT(DISTINCT order_id) n FROM inventory_consumptions WHERE merchant_id=?", (self.merchant,)).fetchone()["n"]
+        self.assertEqual(consumed_orders, 20)
+
+    def test_recipe_proposals_require_manager_confirmation_and_explicit_portions(self):
+        self.service.ingest_invoice(self.merchant, {"external_id": "proposal-stock", "vendor": "Vendor", "invoice_date": "2026-07-01", "total_cents": 1000, "items": [{"ingredient": "Salmon", "quantity": 10, "unit": "lb", "unit_cost_cents": 100}]})
+        self.service.upsert_menu_item(self.merchant, {"external_id": "salmon", "name": "Grilled Salmon", "price_cents": 2400})
+        proposal = self.service.propose_recipes(self.merchant)["proposals"][0]
+        self.assertEqual(proposal["status"], "pending")
+        with self.assertRaises(ValueError): self.service.review_recipe_proposal(self.merchant, proposal["id"], {"decision": "confirmed", "components": proposal["components"]})
+        component = {**proposal["components"][0], "quantity_required": .5, "unit": "lb", "yield_percent": 90}
+        result = self.service.review_recipe_proposal(self.merchant, proposal["id"], {"decision": "confirmed", "reviewed_by": "Chef", "components": [component]})
+        self.assertEqual(result["status"], "confirmed")
+        recipe = self.service.recipe_dashboard(self.merchant)["recipe_links"][0]
+        self.assertEqual(recipe["status"], "confirmed")
+
+    def test_prediction_backtesting_policy_and_message_safety_evaluation(self):
+        for index, day in enumerate((1, 15, 29, 43)):
+            self.service.ingest_order(self.merchant, {"external_id": f"eval-{index}", "source": "square", "payment_fingerprint": "eval-guest", "occurred_at": f"2026-06-{day if day <= 30 else day-30:02d}T18:00:00+00:00" if day <= 30 else f"2026-07-{day-30:02d}T18:00:00+00:00", "total_cents": 3000, "items": [{"name": "Ribs", "quantity": 1, "unit_price_cents": 3000}]})
+        backtest = self.service.run_backtest(self.merchant)
+        self.assertEqual(backtest["status"], "completed")
+        self.assertEqual(backtest["metrics"]["case_count"], 1)
+        self.assertEqual(backtest["metrics"]["item_accuracy"], 1)
+        policy = self.service.set_campaign_policy(self.merchant, {"mode": "assisted", "automation_threshold": .9, "minimum_margin_cents": 500})
+        self.assertEqual(policy["mode"], "assisted")
+        evaluations = self.service.evaluation_dashboard(self.merchant)
+        self.assertEqual(evaluations["evaluations"][0]["evaluation_type"], "historical_backtest")
+
+    def test_openai_strategy_failure_retries_then_safely_sends_nothing(self):
+        with patch.dict(os.environ, {"OPENAI_PREDICTION_MAX_ATTEMPTS": "2", "OPENAI_PREDICTION_TIMEOUT_SECONDS": "1"}):
+            predictor = OpenAIBehaviorPredictor(api_key="test")
+        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("offline")) as request:
+            self.assertEqual(predictor.predict({"profile": {"return_probabilities_json": "{}"}}), [])
+        self.assertEqual(request.call_count, 2)
+        self.assertTrue(predictor.last_run_metadata["fallback"])
+        self.assertEqual(predictor.last_run_metadata["prompt_version"], "strategy-v2")
 
 if __name__ == "__main__": unittest.main()

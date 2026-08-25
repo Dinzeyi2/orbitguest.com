@@ -9,6 +9,8 @@ import statistics
 import math
 from collections import Counter
 from .pos import ConfigurablePOSAdapter
+from .inventory import InventoryEngine
+from .evaluation import EvaluationEngine
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
@@ -29,6 +31,8 @@ class OrbitService:
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.predictor = predictor
         self.delivery = delivery
+        self.inventory = InventoryEngine(db)
+        self.evaluations = EvaluationEngine(db)
 
     def _audit(self, c, merchant, action, entity_type, entity_id, metadata=None, actor="api"):
         c.execute("INSERT INTO audit_log(id,merchant_id,action,actor,entity_type,entity_id,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
@@ -194,13 +198,39 @@ class OrbitService:
             menu = c.execute("SELECT id FROM menu_items WHERE merchant_id=? AND id=?", (merchant, data["menu_item_id"])).fetchone()
             if not product or not menu: raise KeyError("product or menu item not found")
             link_id = uid("rcp")
-            c.execute("""INSERT INTO recipe_links VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(product_id,menu_item_id) DO UPDATE SET quantity_required=excluded.quantity_required,unit=excluded.unit,confidence=excluded.confidence,status=excluded.status""", (link_id, merchant, product["id"], menu["id"], data["quantity_required"], data["unit"], data.get("confidence", 1.0), data.get("status", "confirmed"), now()))
+            stamp = now()
+            c.execute("""INSERT INTO recipe_links(id,merchant_id,product_id,menu_item_id,quantity_required,unit,confidence,status,waste_percent,yield_percent,packaging_cost_cents,substitution_group,confirmed_by,confirmed_at,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(product_id,menu_item_id) DO UPDATE SET
+                quantity_required=excluded.quantity_required,unit=excluded.unit,confidence=excluded.confidence,status=excluded.status,
+                waste_percent=excluded.waste_percent,yield_percent=excluded.yield_percent,packaging_cost_cents=excluded.packaging_cost_cents,
+                substitution_group=excluded.substitution_group,confirmed_by=excluded.confirmed_by,confirmed_at=excluded.confirmed_at""",
+                (link_id, merchant, product["id"], menu["id"], data["quantity_required"], normalize(data["unit"]), data.get("confidence", 1.0), data.get("status", "confirmed"), data.get("waste_percent", 0), data.get("yield_percent", 100), data.get("packaging_cost_cents", 0), data.get("substitution_group"), data.get("confirmed_by", "restaurant_manager"), stamp if data.get("status", "confirmed") == "confirmed" else None, stamp))
         return {"id": link_id}
 
     def recipe_dashboard(self, merchant):
         with self.db.connect() as c:
-            rows = c.execute("""SELECT r.id,p.canonical_name ingredient,p.sku,m.name menu_item,m.external_id,r.quantity_required,r.unit,r.confidence,r.status FROM recipe_links r JOIN catalog_products p ON p.id=r.product_id JOIN menu_items m ON m.id=r.menu_item_id WHERE r.merchant_id=? ORDER BY m.name""", (merchant,)).fetchall()
+            rows = c.execute("""SELECT r.id,p.canonical_name ingredient,p.sku,m.name menu_item,m.external_id,r.quantity_required,r.unit,r.confidence,r.status,
+                r.waste_percent,r.yield_percent,r.packaging_cost_cents,r.substitution_group,r.confirmed_by,r.confirmed_at
+                FROM recipe_links r JOIN catalog_products p ON p.id=r.product_id JOIN menu_items m ON m.id=r.menu_item_id WHERE r.merchant_id=? ORDER BY m.name""", (merchant,)).fetchall()
         return {"recipe_links": [dict(row) for row in rows]}
+
+    def set_unit_conversion(self, merchant, data): return self.inventory.set_conversion(merchant, data)
+    def propose_recipes(self, merchant): return self.inventory.propose_recipes(merchant)
+    def review_recipe_proposal(self, merchant, proposal_id, data): return self.inventory.review_proposal(merchant, proposal_id, data)
+    def adjust_inventory(self, merchant, data): return self.inventory.adjustment(merchant, data)
+    def inventory_dashboard(self, merchant, incentive_cents=0): return self.inventory.dashboard(merchant, incentive_cents)
+    def set_campaign_policy(self, merchant, data): return self.evaluations.set_policy(merchant, data)
+    def evaluation_dashboard(self, merchant): return self.evaluations.dashboard(merchant)
+    def run_backtest(self, merchant, data=None): return self.evaluations.backtest(merchant, int((data or {}).get("holdout", 1)))
+    def run_message_evaluation(self, merchant): return self.evaluations.evaluate_messages(merchant)
+
+    def approve_campaign(self, merchant, campaign_id, approved_by="restaurant_manager"):
+        with self.db.connect() as c:
+            campaign = c.execute("SELECT id FROM campaigns WHERE id=? AND merchant_id=? AND status='approval_required'", (campaign_id, merchant)).fetchone()
+            if not campaign: raise KeyError("campaign awaiting approval not found")
+            c.execute("UPDATE campaigns SET status='queued' WHERE id=?", (campaign_id,))
+            self._audit(c, merchant, "campaign.approved", "campaign", campaign_id, {"approved_by": approved_by})
+        return {"id": campaign_id, "status": "queued"}
 
     def update_operational_state(self, merchant, data):
         with self.db.connect() as c:
@@ -418,6 +448,9 @@ class OrbitService:
             if order and order["guest_id"]: self._rebuild_behavior(c, merchant, order["guest_id"])
 
     def run_behavior_engine(self, merchant):
+        inventory_guardrails = self.inventory.dashboard(merchant)
+        inventory_menu = {normalize(row["menu_item"]): row for row in inventory_guardrails["menu_items"]}
+        policy = self.evaluations.policy(merchant)
         with self.db.connect() as c:
             guests = c.execute("SELECT id FROM guests WHERE merchant_id=?", (merchant,)).fetchall()
             for guest in guests: self._rebuild_behavior(c, merchant, guest["id"])
@@ -450,14 +483,23 @@ class OrbitService:
                     FROM campaigns WHERE merchant_id=? AND guest_id=?""", (merchant, profile["guest_id"], merchant, profile["guest_id"], merchant, profile["guest_id"], merchant, profile["guest_id"], merchant, profile["guest_id"], merchant, profile["guest_id"])).fetchone())
                 # Contact details and names never leave Orbit for prediction. The model
                 # receives behavioral facts only; delivery resolves the recipient later.
-                behavior = {key: profile[key] for key in ("visit_count", "lifetime_spend_cents", "average_ticket_cents", "first_visit_at", "last_visit_at", "average_interval_days", "interval_stddev_days", "days_since_last_visit", "overdue_by_days", "favorite_weekday", "favorite_hour", "predicted_next_visit_at", "behavior_status", "confidence", "weekday_distribution_json", "hour_distribution_json")}
+                behavior = {key: profile[key] for key in ("visit_count", "lifetime_spend_cents", "average_ticket_cents", "median_ticket_cents", "first_visit_at", "last_visit_at", "average_interval_days", "interval_stddev_days", "days_since_last_visit", "overdue_by_days", "favorite_weekday", "favorite_hour", "predicted_next_visit_at", "behavior_status", "confidence", "weekday_distribution_json", "hour_distribution_json", "return_probabilities_json")}
                 decision_facts = {"profile": behavior, "favorite_items": affinities, "frequent_item_pairs": pairs, "message_history": engagement, "recent_supplier_deliveries": inventory, "menu_economics": menu_economics, "operational_state": operational}
                 context_key = hashlib.sha256(json.dumps(decision_facts, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:24]
                 if c.execute("SELECT 1 FROM predictions WHERE merchant_id=? AND guest_id=? AND trigger_ref LIKE ? LIMIT 1", (merchant, profile["guest_id"], f"{context_key}:%")).fetchone():
                     continue
                 context = {"now": now(), **decision_facts}
                 if self.predictor:
-                    opportunities = self.predictor.predict(context)
+                    daily_limit = max(1, int(__import__("os").getenv("OPENAI_PREDICTION_MAX_DAILY_CALLS", "1000")))
+                    today = datetime.now(timezone.utc).date().isoformat()
+                    calls_today = c.execute("SELECT COUNT(*) n FROM prediction_runs WHERE merchant_id=? AND component='strategy_copy' AND created_at>=?", (merchant, today)).fetchone()["n"]
+                    if calls_today >= daily_limit:
+                        opportunities = []
+                        metadata = {"model": self.predictor.__class__.__name__, "prompt_version": "budget-guard", "latency_ms": 0, "attempts": 0, "fallback": True}
+                    else:
+                        opportunities = self.predictor.predict(context)
+                        metadata = getattr(self.predictor, "last_run_metadata", None) or {"model": self.predictor.__class__.__name__, "prompt_version": "unknown", "latency_ms": None, "attempts": 1, "fallback": False}
+                    c.execute("INSERT INTO prediction_runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (uid("prun"), merchant, profile["guest_id"], "strategy_copy", metadata.get("prompt_version", "unknown"), "fallback" if metadata.get("fallback") else "completed", metadata.get("latency_ms"), None, context_key, json.dumps(opportunities), None, metadata.get("attempts", 1), now()))
                 elif profile["behavior_status"] == "overdue":
                     opportunities = [{"type": "habit_interruption", "item": favorite["normalized_item"] if favorite else "", "score": profile["confidence"], "reason": f"Expected return after {profile['visit_count']} visits", "send_at": now(), "subject": "Your usual is waiting", "message": f"Your usual {favorite['display_name'] if favorite else 'order'} is ready when you are."}]
                 else: opportunities = []
@@ -465,8 +507,10 @@ class OrbitService:
                     trigger = f"{context_key}:{opportunity['type']}"
                     try:
                         prediction_id = uid("pred")
-                        item_key = normalize(opportunity.get("item", ""))
-                        economics = next((row for row in menu_economics if item_key and (item_key in normalize(row["menu_item"]) or normalize(row["menu_item"]) in item_key)), None)
+                        item_key = favorite["normalized_item"] if favorite else normalize(opportunity.get("item", ""))
+                        statistical_probabilities = json.loads(profile["return_probabilities_json"] or "{}")
+                        statistical_score = max([float(profile["confidence"]), *[float(value) for value in statistical_probabilities.values()]])
+                        economics = next((row for key,row in inventory_menu.items() if item_key and (item_key in key or key in item_key)), None)
                         delivery_row = next((row for row in inventory if item_key and (item_key in normalize(row["canonical_name"]) or item_key in normalize(row.get("menu_items") or ""))), None)
                         freshness_days = int(__import__("os").getenv("ORBIT_INVENTORY_FRESHNESS_DAYS", "90"))
                         fresh_after = (datetime.now(timezone.utc)-timedelta(days=freshness_days)).date().isoformat()
@@ -475,27 +519,37 @@ class OrbitService:
                         cooldown_days = int(__import__("os").getenv("ORBIT_CONTACT_COOLDOWN_DAYS", "7"))
                         cooldown_start = (datetime.now(timezone.utc)-timedelta(days=cooldown_days)).isoformat()
                         contacted_recently = bool(channel and c.execute("SELECT 1 FROM campaigns WHERE merchant_id=? AND guest_id=? AND channel=? AND sent_at>=?", (merchant, profile["guest_id"], channel, cooldown_start)).fetchone())
-                        expected_value = int(opportunity.get("expected_order_value_cents") or profile["median_ticket_cents"] or profile["average_ticket_cents"])
-                        margin = int(economics["estimated_gross_margin_cents"]) if economics and economics["estimated_gross_margin_cents"] is not None else 0
+                        expected_value = int(profile["median_ticket_cents"] or profile["average_ticket_cents"])
+                        margin = int(economics["estimated_contribution_margin_cents"]) if economics else 0
                         message_cost = int(__import__("os").getenv("ORBIT_SMS_COST_CENTS", "2")) if channel == "sms" else int(__import__("os").getenv("ORBIT_EMAIL_COST_CENTS", "1"))
-                        expected_incremental_profit = round(max(0, margin) * float(opportunity["score"]) - message_cost)
+                        expected_incremental_profit = round(max(0, margin) * statistical_score - message_cost)
                         capacity_available = operational["accepting_orders"] and (operational["capacity_remaining"] is None or operational["capacity_remaining"] > 0)
-                        eligibility = {"authorized_channel": bool(channel), "not_suppressed": not suppressed, "cooldown_clear": not contacted_recently, "menu_and_recipe_confirmed": bool(economics), "estimated_inventory_available": recent_delivery, "capacity_available": capacity_available, "positive_expected_incremental_profit": expected_incremental_profit > 0, "expected_incremental_profit_cents": expected_incremental_profit}
+                        inventory_available = bool(economics and economics["estimated_portions"] > 0 and economics["status"] not in ("probably_unavailable", "inventory_uncertain"))
+                        eligibility = {"authorized_channel": bool(channel), "not_suppressed": not suppressed, "cooldown_clear": not contacted_recently, "menu_and_recipe_confirmed": bool(economics), "estimated_inventory_available": inventory_available and recent_delivery, "inventory_confidence": economics["inventory_confidence"] if economics else 0, "capacity_available": capacity_available, "positive_expected_incremental_profit": expected_incremental_profit > 0 and margin >= policy["minimum_margin_cents"], "expected_incremental_profit_cents": expected_incremental_profit}
                         model_action = opportunity.get("action") or ("send_sms" if channel == "sms" else "send_email" if channel == "email" else "do_nothing")
-                        do_not_contact = bool(opportunity.get("do_not_contact")) or opportunity["score"] < .6 or not all((eligibility["authorized_channel"], eligibility["not_suppressed"], eligibility["cooldown_clear"], eligibility["menu_and_recipe_confirmed"], eligibility["estimated_inventory_available"], eligibility["capacity_available"], eligibility["positive_expected_incremental_profit"])) or model_action in ("wait", "do_nothing")
+                        do_not_contact = bool(opportunity.get("do_not_contact")) or statistical_score < .6 or not all((eligibility["authorized_channel"], eligibility["not_suppressed"], eligibility["cooldown_clear"], eligibility["menu_and_recipe_confirmed"], eligibility["estimated_inventory_available"], eligibility["capacity_available"], eligibility["positive_expected_incremental_profit"])) or model_action in ("wait", "do_nothing")
                         prediction_status = "permission_required" if not channel else "do_not_contact" if do_not_contact else "eligible"
-                        probabilities = opportunity.get("return_probabilities") or {f"within_{key}_days": value for key,value in json.loads(profile["return_probabilities_json"] or "{}").items()}
-                        basket = opportunity.get("predicted_basket") or [opportunity.get("item", "")]
+                        probabilities = {f"within_{key}_days": value for key,value in statistical_probabilities.items()}
+                        basket = [row["display_name"] for row in affinities[:3]] or [opportunity.get("item", "")]
+                        statistical_center = profile["predicted_next_visit_at"]
+                        if statistical_center:
+                            center = datetime.fromisoformat(statistical_center.replace("Z", "+00:00"))
+                            time_window_start, time_window_end = (center-timedelta(minutes=45)).isoformat(), (center+timedelta(minutes=45)).isoformat()
+                        else:
+                            time_window_start, time_window_end = opportunity.get("time_window_start"), opportunity.get("time_window_end")
                         c.execute("""INSERT INTO predictions(id,merchant_id,guest_id,prediction_type,normalized_item,score,reason,recommended_channel,recommended_send_at,status,trigger_ref,created_at,action,expected_order_value_cents,return_probabilities_json,time_window_start,time_window_end,predicted_basket_json,do_not_contact,eligibility_json)
-                                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (prediction_id, merchant, profile["guest_id"], opportunity["type"], item_key, opportunity["score"], opportunity["reason"], channel, opportunity["send_at"], prediction_status, trigger, now(), "do_nothing" if do_not_contact else model_action, expected_value, json.dumps(probabilities), opportunity.get("time_window_start"), opportunity.get("time_window_end"), json.dumps(basket), 1 if do_not_contact else 0, json.dumps(eligibility)))
+                                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (prediction_id, merchant, profile["guest_id"], opportunity["type"], item_key, statistical_score, opportunity["reason"], channel, opportunity["send_at"], prediction_status, trigger, now(), "do_nothing" if do_not_contact else model_action, expected_value, json.dumps(probabilities), time_window_start, time_window_end, json.dumps(basket), 1 if do_not_contact else 0, json.dumps(eligibility)))
                         if not do_not_contact:
                             cohort_size = c.execute("SELECT COUNT(*) count FROM behavior_profiles WHERE merchant_id=?", (merchant,)).fetchone()["count"]
                             control_percent = max(0, min(50, int(__import__("os").getenv("ORBIT_CONTROL_PERCENT", "10"))))
                             control = cohort_size >= 20 and int(hashlib.sha256(f"{profile['guest_id']}:{trigger}".encode()).hexdigest()[:8], 16) % 100 < control_percent
                             campaign_id = uid("cam")
                             window_end = opportunity.get("time_window_end") or (datetime.fromisoformat(opportunity["send_at"].replace("Z", "+00:00")) + timedelta(days=7)).isoformat()
+                            needs_approval = policy["mode"] == "pilot" or (policy["mode"] == "assisted" and (statistical_score < policy["automation_threshold"] or economics["inventory_confidence"] < policy["minimum_inventory_confidence"] or model_action == "incentive"))
+                            campaign_status = "control" if control else "approval_required" if needs_approval else "queued"
                             c.execute("""INSERT INTO campaigns(id,merchant_id,guest_id,channel,trigger_type,trigger_ref,subject,body,status,scheduled_at,sent_at,created_at,action,control_group,prediction_window_end,eligibility_json)
                                          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (campaign_id, merchant, profile["guest_id"], channel, opportunity["type"], prediction_id, opportunity["subject"], opportunity["message"], "control" if control else "queued", opportunity["send_at"], None, now(), model_action, 1 if control else 0, window_end, json.dumps(eligibility)))
+                            c.execute("UPDATE campaigns SET status=? WHERE id=?", (campaign_status, campaign_id))
                             c.execute("INSERT INTO campaign_outcomes(campaign_id,merchant_id,guest_id,group_name) VALUES(?,?,?,?)", (campaign_id, merchant, profile["guest_id"], "control" if control else "messaged"))
                         created += 1
                     except __import__("sqlite3").IntegrityError: pass

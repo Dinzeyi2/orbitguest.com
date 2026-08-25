@@ -143,7 +143,9 @@ CREATE TABLE IF NOT EXISTS menu_items (
 CREATE TABLE IF NOT EXISTS recipe_links (
  id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, product_id TEXT NOT NULL,
  menu_item_id TEXT NOT NULL, quantity_required REAL NOT NULL, unit TEXT NOT NULL,
- confidence REAL NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL,
+ confidence REAL NOT NULL, status TEXT NOT NULL, waste_percent REAL NOT NULL DEFAULT 0,
+ yield_percent REAL NOT NULL DEFAULT 100, packaging_cost_cents INTEGER NOT NULL DEFAULT 0,
+ substitution_group TEXT, confirmed_by TEXT, confirmed_at TEXT, created_at TEXT NOT NULL,
  UNIQUE(product_id,menu_item_id), FOREIGN KEY(product_id) REFERENCES catalog_products(id),
  FOREIGN KEY(menu_item_id) REFERENCES menu_items(id)
 );
@@ -203,6 +205,52 @@ CREATE TABLE IF NOT EXISTS inventory_events (
  unit_cost_cents INTEGER NOT NULL, occurred_at TEXT NOT NULL,
  FOREIGN KEY(invoice_id) REFERENCES invoices(id)
 );
+CREATE TABLE IF NOT EXISTS unit_conversions (
+ id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, from_unit TEXT NOT NULL, to_unit TEXT NOT NULL,
+ multiplier REAL NOT NULL CHECK(multiplier>0), ingredient_key TEXT NOT NULL DEFAULT '*',
+ created_at TEXT NOT NULL, UNIQUE(merchant_id,ingredient_key,from_unit,to_unit)
+);
+CREATE TABLE IF NOT EXISTS inventory_adjustments (
+ id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, product_id TEXT NOT NULL, location_id TEXT,
+ quantity REAL NOT NULL, unit TEXT NOT NULL, reason TEXT NOT NULL,
+ occurred_at TEXT NOT NULL, notes TEXT, created_at TEXT NOT NULL,
+ FOREIGN KEY(product_id) REFERENCES catalog_products(id)
+);
+CREATE TABLE IF NOT EXISTS inventory_consumptions (
+ id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, order_id TEXT NOT NULL, order_item_id TEXT NOT NULL,
+ recipe_link_id TEXT NOT NULL, product_id TEXT NOT NULL, location_id TEXT,
+ quantity REAL NOT NULL, unit TEXT NOT NULL, occurred_at TEXT NOT NULL, created_at TEXT NOT NULL,
+ UNIQUE(order_item_id,recipe_link_id), FOREIGN KEY(order_id) REFERENCES orders(id),
+ FOREIGN KEY(recipe_link_id) REFERENCES recipe_links(id), FOREIGN KEY(product_id) REFERENCES catalog_products(id)
+);
+CREATE TABLE IF NOT EXISTS recipe_proposals (
+ id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, menu_item_id TEXT NOT NULL,
+ components_json TEXT NOT NULL, rationale TEXT NOT NULL, confidence REAL NOT NULL,
+ status TEXT NOT NULL, reviewed_by TEXT, reviewed_at TEXT, created_at TEXT NOT NULL,
+ FOREIGN KEY(menu_item_id) REFERENCES menu_items(id)
+);
+CREATE TABLE IF NOT EXISTS prediction_model_versions (
+ id TEXT PRIMARY KEY, merchant_id TEXT, component TEXT NOT NULL, version TEXT NOT NULL,
+ model TEXT, prompt_hash TEXT, configuration_json TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+ created_at TEXT NOT NULL, UNIQUE(merchant_id,component,version)
+);
+CREATE TABLE IF NOT EXISTS prediction_runs (
+ id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, guest_id TEXT, component TEXT NOT NULL,
+ version TEXT NOT NULL, status TEXT NOT NULL, latency_ms INTEGER, estimated_cost_micros INTEGER,
+ input_hash TEXT NOT NULL, output_json TEXT, error TEXT, attempts INTEGER NOT NULL DEFAULT 1,
+ created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS evaluation_runs (
+ id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, evaluation_type TEXT NOT NULL,
+ model_version TEXT NOT NULL, status TEXT NOT NULL, metrics_json TEXT NOT NULL,
+ cases_json TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS campaign_policies (
+ merchant_id TEXT PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'pilot', automation_threshold REAL NOT NULL DEFAULT .85,
+ max_discount_cents INTEGER NOT NULL DEFAULT 0, max_daily_messages INTEGER NOT NULL DEFAULT 100,
+ minimum_inventory_confidence REAL NOT NULL DEFAULT .8, minimum_margin_cents INTEGER NOT NULL DEFAULT 0,
+ updated_at TEXT NOT NULL, FOREIGN KEY(merchant_id) REFERENCES merchants(id)
+);
 CREATE TABLE IF NOT EXISTS campaigns (
  id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, guest_id TEXT NOT NULL, channel TEXT NOT NULL,
  trigger_type TEXT NOT NULL, trigger_ref TEXT, subject TEXT, body TEXT NOT NULL,
@@ -257,6 +305,9 @@ CREATE INDEX IF NOT EXISTS idx_pos_connections ON pos_connections(merchant_id,pr
 CREATE INDEX IF NOT EXISTS idx_square_events_status ON square_webhook_events(status,received_at);
 CREATE INDEX IF NOT EXISTS idx_refunds_order ON refunds(merchant_id,order_id,status);
 CREATE INDEX IF NOT EXISTS idx_recipe_menu ON recipe_links(merchant_id,menu_item_id,status);
+CREATE INDEX IF NOT EXISTS idx_inventory_consumption_order ON inventory_consumptions(merchant_id,order_id);
+CREATE INDEX IF NOT EXISTS idx_inventory_adjustment_product ON inventory_adjustments(merchant_id,product_id,occurred_at);
+CREATE INDEX IF NOT EXISTS idx_prediction_runs_merchant ON prediction_runs(merchant_id,component,created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_campaign ON outbound_messages(campaign_id,status);
 """
 
@@ -308,6 +359,9 @@ class Database:
             prediction_columns = {row["name"] for row in connection.execute("PRAGMA table_info(predictions)")}
             for name, definition in (("action", "TEXT NOT NULL DEFAULT 'wait'"), ("expected_order_value_cents", "INTEGER"), ("return_probabilities_json", "TEXT NOT NULL DEFAULT '{}'"), ("time_window_start", "TEXT"), ("time_window_end", "TEXT"), ("predicted_basket_json", "TEXT NOT NULL DEFAULT '[]'"), ("do_not_contact", "INTEGER NOT NULL DEFAULT 0"), ("eligibility_json", "TEXT NOT NULL DEFAULT '{}'")):
                 if name not in prediction_columns: connection.execute(f"ALTER TABLE predictions ADD COLUMN {name} {definition}")
+            recipe_columns = {row["name"] for row in connection.execute("PRAGMA table_info(recipe_links)")}
+            for name, definition in (("waste_percent", "REAL NOT NULL DEFAULT 0"), ("yield_percent", "REAL NOT NULL DEFAULT 100"), ("packaging_cost_cents", "INTEGER NOT NULL DEFAULT 0"), ("substitution_group", "TEXT"), ("confirmed_by", "TEXT"), ("confirmed_at", "TEXT")):
+                if name not in recipe_columns: connection.execute(f"ALTER TABLE recipe_links ADD COLUMN {name} {definition}")
             square_event_columns = {row["name"] for row in connection.execute("PRAGMA table_info(square_webhook_events)")}
             for name, definition in (("attempts", "INTEGER NOT NULL DEFAULT 0"), ("next_attempt_at", "TEXT")):
                 if name not in square_event_columns:

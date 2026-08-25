@@ -124,6 +124,18 @@ runs the behavior engine, and returns profiles plus expected predictions. It ref
 unless `SQUARE_ENVIRONMENT=sandbox` and `ORBIT_DEMO_MODE=true`, and it rejects any
 merchant with an active Production Square installation. See [`docs/DEMO.md`](DEMO.md).
 
+## Recipe, inventory, and evaluation endpoints
+
+- `POST /v1/recipes/proposals` and `POST /v1/recipes/proposals/{id}/review`
+- `POST /v1/inventory/conversions` and `POST /v1/inventory/adjustments`
+- `GET /v1/dashboard/inventory`
+- `POST /v1/campaign-policy` and `POST /v1/campaigns/{id}/approve`
+- `POST /v1/evaluations/backtest`, `POST /v1/evaluations/messages`, and
+  `GET /v1/dashboard/evaluations`
+
+See [`docs/INTELLIGENCE.md`](INTELLIGENCE.md) for payload expectations, safety
+semantics, model boundaries, and the rollout procedure.
+
 The current service preserves files on `ORBIT_STORAGE_DIR`, records extraction
 confidence, and routes confidence below 0.75 to `needs_review`. Add malware scanning
 and object-storage encryption before accepting untrusted production attachments.
