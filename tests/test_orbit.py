@@ -127,6 +127,23 @@ class OrbitFlowTest(unittest.TestCase):
             Database(str(path))
             self.assertTrue(path.is_file())
 
+    def test_legacy_railway_database_adds_messaging_columns_before_provider_index(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "legacy.db"
+            connection = sqlite3.connect(path)
+            connection.execute("""CREATE TABLE outbound_messages (
+                id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
+                guest_id TEXT NOT NULL, channel TEXT NOT NULL, recipient TEXT NOT NULL,
+                provider_message_id TEXT, status TEXT NOT NULL, error TEXT,
+                sent_at TEXT, created_at TEXT NOT NULL)""")
+            connection.commit(); connection.close()
+            database = Database(str(path))
+            with database.connect() as migrated:
+                columns = {row["name"] for row in migrated.execute("PRAGMA table_info(outbound_messages)")}
+                indexes = {row["name"] for row in migrated.execute("PRAGMA index_list(outbound_messages)")}
+            self.assertTrue({"provider", "attempts", "next_attempt_at", "last_event_at", "dead_lettered_at", "idempotency_key"}.issubset(columns))
+            self.assertIn("idx_messages_provider", indexes)
+
     def test_resend_svix_signature_verification(self):
         secret_bytes = b"test-webhook-secret"
         secret = "whsec_" + base64.b64encode(secret_bytes).decode()

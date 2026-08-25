@@ -326,7 +326,6 @@ CREATE INDEX IF NOT EXISTS idx_inventory_consumption_order ON inventory_consumpt
 CREATE INDEX IF NOT EXISTS idx_inventory_adjustment_product ON inventory_adjustments(merchant_id,product_id,occurred_at);
 CREATE INDEX IF NOT EXISTS idx_prediction_runs_merchant ON prediction_runs(merchant_id,component,created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_campaign ON outbound_messages(campaign_id,status);
-CREATE INDEX IF NOT EXISTS idx_messages_provider ON outbound_messages(provider,provider_message_id);
 """
 
 class Database:
@@ -381,6 +380,10 @@ class Database:
             for name, definition in (("provider", "TEXT"), ("attempts", "INTEGER NOT NULL DEFAULT 0"), ("next_attempt_at", "TEXT"), ("last_event_at", "TEXT"), ("dead_lettered_at", "TEXT"), ("idempotency_key", "TEXT")):
                 if name not in message_columns: connection.execute(f"ALTER TABLE outbound_messages ADD COLUMN {name} {definition}")
             connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_outbound_idempotency ON outbound_messages(idempotency_key) WHERE idempotency_key IS NOT NULL")
+            # These indexes must be created after legacy Railway databases receive
+            # the new messaging columns above. Creating them in SCHEMA would make
+            # executescript fail before migrations can run.
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_messages_provider ON outbound_messages(provider,provider_message_id)")
             recipe_columns = {row["name"] for row in connection.execute("PRAGMA table_info(recipe_links)")}
             for name, definition in (("waste_percent", "REAL NOT NULL DEFAULT 0"), ("yield_percent", "REAL NOT NULL DEFAULT 100"), ("packaging_cost_cents", "INTEGER NOT NULL DEFAULT 0"), ("substitution_group", "TEXT"), ("confirmed_by", "TEXT"), ("confirmed_at", "TEXT")):
                 if name not in recipe_columns: connection.execute(f"ALTER TABLE recipe_links ADD COLUMN {name} {definition}")
