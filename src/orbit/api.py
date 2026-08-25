@@ -13,11 +13,13 @@ from .prediction import OpenAIBehaviorPredictor
 from .messaging import MessageDelivery
 from .square import SquareIntegration, SquareError
 from .demo import BehaviorDemoSeeder, DemoSeedError
+from .telnyx import TelnyxWebhook
 
 class Handler(BaseHTTPRequestHandler):
     service = None
     resend = None
     square = None
+    telnyx = None
     def _send(self, status, body):
         payload = json.dumps(body).encode()
         self.send_response(status); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(payload))); self.end_headers(); self.wfile.write(payload)
@@ -32,6 +34,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             path, raw = urlparse(self.path).path, self._raw_body()
             data = json.loads(raw)
+            if path == "/v1/webhooks/telnyx":
+                if not self.telnyx or not self.telnyx.verify(raw, self.headers):
+                    return self._send(401, {"error": "invalid Telnyx signature"})
+                return self._send(202, self.service.process_telnyx_event(data))
             if path == "/v1/webhooks/resend":
                 if not self.resend or not self.resend.verify(raw, {key.lower(): value for key, value in self.headers.items()}):
                     return self._send(401, {"error": "invalid Resend signature"})
@@ -130,6 +136,7 @@ def main():
     threading.Thread(target=Handler.service.behavior_worker_loop, args=(behavior_worker_stop, behavior_interval), daemon=True).start()
     resend_key, resend_secret = os.getenv("RESEND_API_KEY"), os.getenv("RESEND_WEBHOOK_SECRET")
     Handler.resend = ResendInboundClient(resend_key, resend_secret) if resend_key and resend_secret else None
+    Handler.telnyx = TelnyxWebhook() if os.getenv("TELNYX_PUBLIC_KEY") else None
     ThreadingHTTPServer(("0.0.0.0", int(os.getenv("PORT", args.port))), Handler).serve_forever()
 
 if __name__ == "__main__": main()

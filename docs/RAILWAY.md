@@ -16,9 +16,16 @@
    - `RESEND_WEBHOOK_SECRET=<the whsec_ value from the Resend webhook>`
    - `OPENAI_PREDICTION_MODEL=gpt-4.1-mini`
    - `ORBIT_EMAIL_FROM=Orbit <messages@your-verified-domain>`
-   - `TWILIO_ACCOUNT_SID=<your Twilio account SID>`
-   - `TWILIO_AUTH_TOKEN=<your Twilio auth token>`
-   - `TWILIO_FROM_NUMBER=<your Twilio sending number>`
+   - `TELNYX_API_KEY=<your Telnyx API key>`
+   - `TELNYX_FROM_NUMBER=<your active Telnyx number in E.164 format>`
+   - `TELNYX_PUBLIC_KEY=<the public key from Telnyx Keys & Credentials>`
+   - `TELNYX_MESSAGING_PROFILE_ID=<optional Orbit messaging profile ID>`
+
+   Telnyx should deliver messaging webhooks to
+   `https://api.orbitguest.com/v1/webhooks/telnyx`. Orbit verifies Telnyx's Ed25519
+   signature, records delivery results, and synchronizes STOP/START replies with
+   its own consent and suppression records. Twilio variables remain supported as
+   a fallback when Telnyx is not configured.
    - Square variables listed in [`docs/SQUARE.md`](SQUARE.md)
 5. Redeploy. Railway uses the included start command, its injected `PORT`, and the
    `/health` endpoint.

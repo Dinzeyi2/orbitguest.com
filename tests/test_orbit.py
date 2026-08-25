@@ -9,6 +9,10 @@ from orbit.resend import ResendInboundClient
 from orbit.square import SquareIntegration, SquareClient
 from orbit.demo import BehaviorDemoSeeder, DemoSeedError
 from orbit.prediction import OpenAIBehaviorPredictor
+from orbit.messaging import MessageDelivery
+from orbit.telnyx import TelnyxWebhook
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 import hashlib
 import hmac
 import json
@@ -139,6 +143,52 @@ class OrbitFlowTest(unittest.TestCase):
             ResendInboundClient("re_test", "secret")._json("/emails/receiving/test")
         request = urlopen.call_args.args[0]
         self.assertEqual(request.get_header("User-agent"), ResendInboundClient.USER_AGENT)
+
+    def test_telnyx_sms_delivery_uses_v2_api(self):
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+            def read(self): return b'{"data":{"id":"telnyx-message-1"}}'
+        environment = {"TELNYX_API_KEY": "KEY", "TELNYX_FROM_NUMBER": "+14075550100", "TELNYX_MESSAGING_PROFILE_ID": "profile-1"}
+        with patch.dict(os.environ, environment, clear=True), patch("urllib.request.urlopen", return_value=Response()) as urlopen:
+            provider_id = MessageDelivery().send("sms", "+14075550101", "", "Dinner is ready")
+        self.assertEqual(provider_id, "telnyx-message-1")
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "https://api.telnyx.com/v2/messages")
+        self.assertEqual(request.get_header("Authorization"), "Bearer KEY")
+        self.assertEqual(json.loads(request.data), {"to": "+14075550101", "from": "+14075550100", "text": "Dinner is ready", "messaging_profile_id": "profile-1"})
+
+    def test_telnyx_signature_delivery_and_consent_keywords(self):
+        private_key = Ed25519PrivateKey.generate()
+        public_key = base64.b64encode(private_key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)).decode()
+        raw = b'{"data":{"id":"evt-1"}}'
+        timestamp = str(int(time.time()))
+        signature = base64.b64encode(private_key.sign(timestamp.encode() + b"|" + raw)).decode()
+        verifier = TelnyxWebhook(public_key)
+        headers = {"Telnyx-Timestamp": timestamp, "Telnyx-Signature-Ed25519": signature}
+        self.assertTrue(verifier.verify(raw, headers))
+        self.assertFalse(verifier.verify(raw + b" ", headers))
+        self.assertFalse(verifier.verify(raw, headers, current_time=int(timestamp) + 301))
+
+        self.order("telnyx-order")
+        guest = self.service.capture_identity(self.merchant, {"payment_fingerprint": "tok_guest_1", "phone": "+14075550101", "terms": {"accepted": True, "version": "v1"}, "consent": {"sms": {"status": "granted", "disclosure_version": "v1"}}})
+        stamp = "2026-08-24T00:00:00+00:00"
+        with self.service.db.connect() as c:
+            c.execute("INSERT INTO campaigns(id,merchant_id,guest_id,channel,trigger_type,body,status,scheduled_at,created_at) VALUES(?,?,?,?,?,?,?,?,?)", ("cam-telnyx", self.merchant, guest["id"], "sms", "test", "Hello", "sent", stamp, stamp))
+            c.execute("INSERT INTO outbound_messages VALUES(?,?,?,?,?,?,?,?,?,?,?)", ("msg-telnyx", self.merchant, "cam-telnyx", guest["id"], "sms", "+14075550101", "telnyx-message-1", "sent", None, stamp, stamp))
+            c.execute("INSERT INTO campaign_outcomes(campaign_id,merchant_id,guest_id,group_name) VALUES(?,?,?,?)", ("cam-telnyx", self.merchant, guest["id"], "messaged"))
+        finalized = {"data": {"id": "evt-final", "event_type": "message.finalized", "payload": {"id": "telnyx-message-1", "completed_at": stamp, "to": [{"status": "delivered"}]}}}
+        self.assertEqual(self.service.process_telnyx_event(finalized)["status"], "delivered")
+        self.assertEqual(self.service.process_telnyx_event(finalized)["status"], "duplicate")
+        stop = {"data": {"id": "evt-stop", "event_type": "message.received", "payload": {"from": {"phone_number": "+14075550101"}, "text": "STOP", "received_at": stamp}}}
+        self.assertEqual(self.service.process_telnyx_event(stop)["status"], "unsubscribed")
+        with self.service.db.connect() as c:
+            self.assertIsNotNone(c.execute("SELECT 1 FROM suppressions WHERE guest_id=? AND channel='sms'", (guest["id"],)).fetchone())
+        start = {"data": {"id": "evt-start", "event_type": "message.received", "payload": {"from": {"phone_number": "+14075550101"}, "text": "START", "received_at": stamp}}}
+        self.assertEqual(self.service.process_telnyx_event(start)["status"], "resubscribed")
+        with self.service.db.connect() as c:
+            self.assertIsNone(c.execute("SELECT 1 FROM suppressions WHERE guest_id=? AND channel='sms'", (guest["id"],)).fetchone())
+            self.assertEqual(c.execute("SELECT status FROM consents WHERE guest_id=? AND channel='sms' ORDER BY rowid DESC LIMIT 1", (guest["id"],)).fetchone()["status"], "granted")
 
     def test_product_history_keeps_old_invoice_and_new_current_value(self):
         base = {"vendor": "Fresh Foods", "currency": "USD", "subtotal_cents": 100, "tax_cents": 0, "total_cents": 100, "confidence": .99}

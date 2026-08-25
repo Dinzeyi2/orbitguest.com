@@ -270,6 +270,10 @@ CREATE TABLE IF NOT EXISTS message_events (
  event_type TEXT NOT NULL, occurred_at TEXT NOT NULL, metadata_json TEXT NOT NULL,
  UNIQUE(outbound_message_id,event_type,occurred_at), FOREIGN KEY(outbound_message_id) REFERENCES outbound_messages(id)
 );
+CREATE TABLE IF NOT EXISTS telnyx_webhook_events (
+ event_id TEXT PRIMARY KEY, event_type TEXT NOT NULL, payload_json TEXT NOT NULL,
+ received_at TEXT NOT NULL, processed_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS campaign_outcomes (
  campaign_id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, guest_id TEXT NOT NULL,
  group_name TEXT NOT NULL, converted INTEGER NOT NULL DEFAULT 0, order_id TEXT,
@@ -309,6 +313,7 @@ CREATE INDEX IF NOT EXISTS idx_inventory_consumption_order ON inventory_consumpt
 CREATE INDEX IF NOT EXISTS idx_inventory_adjustment_product ON inventory_adjustments(merchant_id,product_id,occurred_at);
 CREATE INDEX IF NOT EXISTS idx_prediction_runs_merchant ON prediction_runs(merchant_id,component,created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_campaign ON outbound_messages(campaign_id,status);
+CREATE INDEX IF NOT EXISTS idx_telnyx_events_type ON telnyx_webhook_events(event_type,received_at);
 """
 
 class Database:

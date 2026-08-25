@@ -641,6 +641,50 @@ class OrbitService:
                 c.execute("UPDATE campaign_outcomes SET unsubscribed=1 WHERE campaign_id=?", (message["campaign_id"],))
         return {"event_id": event_id, "status": "recorded"}
 
+    def process_telnyx_event(self, event):
+        """Synchronize Telnyx delivery receipts and inbound SMS consent keywords."""
+        envelope = event.get("data") or {}
+        event_id, event_type = envelope.get("id"), (envelope.get("event_type") or "").lower()
+        payload = envelope.get("payload") or {}
+        if not event_id or not event_type:
+            raise ValueError("invalid Telnyx event")
+        with self.db.connect() as c:
+            if c.execute("SELECT 1 FROM telnyx_webhook_events WHERE event_id=?", (event_id,)).fetchone():
+                return {"status": "duplicate"}
+            result = "ignored"
+            if event_type == "message.finalized":
+                provider_id = payload.get("id")
+                message = c.execute("SELECT * FROM outbound_messages WHERE provider_message_id=?", (provider_id,)).fetchone()
+                if message:
+                    destinations = payload.get("to") or []
+                    provider_status = str((destinations[0] if destinations else {}).get("status") or "").lower()
+                    delivered = provider_status == "delivered"
+                    normalized = "delivered" if delivered else "failed"
+                    occurred = payload.get("completed_at") or now()
+                    c.execute("INSERT OR IGNORE INTO message_events VALUES(?,?,?,?,?,?)", (uid("mse"), message["merchant_id"], message["id"], normalized, occurred, json.dumps({"telnyx_event_id": event_id, "provider_status": provider_status})))
+                    c.execute("UPDATE outbound_messages SET status=?,error=? WHERE id=?", (normalized, None if delivered else provider_status or "delivery_failed", message["id"]))
+                    result = normalized
+            elif event_type == "message.received":
+                sender = (payload.get("from") or {}).get("phone_number")
+                text = str(payload.get("text") or "").strip().upper()
+                message = c.execute("SELECT merchant_id,guest_id,campaign_id FROM outbound_messages WHERE channel='sms' AND recipient=? ORDER BY created_at DESC LIMIT 1", (sender,)).fetchone()
+                if message:
+                    stamp = payload.get("received_at") or now()
+                    if text in {"STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"}:
+                        c.execute("INSERT OR REPLACE INTO suppressions VALUES(?,?,?,?,?)", (message["merchant_id"], message["guest_id"], "sms", "telnyx_opt_out", stamp))
+                        c.execute("INSERT INTO consents VALUES(?,?,?,?,?,?,?,?)", (uid("con"), message["merchant_id"], message["guest_id"], "sms", "denied", "telnyx-keyword", "telnyx_opt_out", stamp))
+                        c.execute("UPDATE campaign_outcomes SET unsubscribed=1 WHERE campaign_id=?", (message["campaign_id"],))
+                        result = "unsubscribed"
+                    elif text in {"START", "YES", "UNSTOP"}:
+                        c.execute("DELETE FROM suppressions WHERE merchant_id=? AND guest_id=? AND channel='sms'", (message["merchant_id"], message["guest_id"]))
+                        c.execute("INSERT INTO consents VALUES(?,?,?,?,?,?,?,?)", (uid("con"), message["merchant_id"], message["guest_id"], "sms", "granted", "telnyx-keyword", "telnyx_opt_in", stamp))
+                        result = "resubscribed"
+                    elif text in {"HELP", "INFO"}:
+                        result = "help"
+            stamp = now()
+            c.execute("INSERT INTO telnyx_webhook_events VALUES(?,?,?,?,?)", (event_id, event_type, json.dumps(event), stamp, stamp))
+        return {"status": result}
+
     def _attribute(self, c, merchant, order_id, guest_id, occurred_at, revenue):
         if not guest_id: return
         campaign = c.execute("""SELECT id,status,control_group,COALESCE(sent_at,scheduled_at) exposure_at FROM campaigns
