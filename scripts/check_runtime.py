@@ -21,6 +21,10 @@ def main():
             raise ValueError("round-trip mismatch")
     except Exception as error:
         raise SystemExit(f"FATAL: Fernet token encryption check failed: {error}") from error
+    if os.getenv("ORBIT_ENABLE_LIVE_MESSAGING", "").lower() == "true":
+        required = ("TELNYX_API_KEY", "TELNYX_FROM_NUMBER", "TELNYX_MESSAGING_PROFILE_ID", "TELNYX_PUBLIC_KEY", "TELNYX_ALLOWED_COUNTRY_PREFIXES", "RESEND_API_KEY", "ORBIT_EMAIL_FROM", "RESEND_WEBHOOK_SECRET")
+        missing = [name for name in required if not os.getenv(name)]
+        if missing: raise SystemExit(f"FATAL: live messaging is enabled but these variables are missing: {', '.join(missing)}")
     print("Orbit runtime check passed: cryptography and Fernet encryption are available.")
 
 if __name__ == "__main__":

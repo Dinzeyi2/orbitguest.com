@@ -13,6 +13,8 @@ from .inventory import InventoryEngine
 from .evaluation import EvaluationEngine
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from .messaging import DeliveryError
 
 def now(): return datetime.now(timezone.utc).isoformat()
 def uid(prefix): return f"{prefix}_{uuid.uuid4().hex}"
@@ -601,6 +603,33 @@ class OrbitService:
             self._audit(c, merchant, "guest.suppressed", "guest", guest_id, {"channel": channel, "reason": reason})
         return {"guest_id": guest_id, "channel": channel, "suppressed": True}
 
+    def update_messaging_settings(self, merchant, data):
+        timezone_name = data.get("timezone", "UTC")
+        try: ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError as error: raise ValueError("invalid IANA timezone") from error
+        for key in ("quiet_hours_start", "quiet_hours_end"):
+            value = data.get(key, "21:00" if key.endswith("start") else "08:00")
+            if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value): raise ValueError(f"invalid {key}")
+        with self.db.connect() as c:
+            c.execute("""INSERT INTO messaging_settings VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(merchant_id) DO UPDATE SET
+                timezone=excluded.timezone,quiet_hours_start=excluded.quiet_hours_start,quiet_hours_end=excluded.quiet_hours_end,
+                max_messages_per_guest_24h=excluded.max_messages_per_guest_24h,max_messages_per_merchant_day=excluded.max_messages_per_merchant_day,
+                sms_help_text=excluded.sms_help_text,updated_at=excluded.updated_at""", (merchant, timezone_name, data.get("quiet_hours_start", "21:00"), data.get("quiet_hours_end", "08:00"), max(1, int(data.get("max_messages_per_guest_24h", 1))), max(1, int(data.get("max_messages_per_merchant_day", 100))), data.get("sms_help_text", "Reply STOP to opt out. Reply START to opt back in."), now()))
+        return self.messaging_settings(merchant)
+
+    def messaging_settings(self, merchant):
+        with self.db.connect() as c: row = c.execute("SELECT * FROM messaging_settings WHERE merchant_id=?", (merchant,)).fetchone()
+        return dict(row) if row else {"merchant_id": merchant, "timezone": "UTC", "quiet_hours_start": "21:00", "quiet_hours_end": "08:00", "max_messages_per_guest_24h": 1, "max_messages_per_merchant_day": 100, "sms_help_text": "Reply STOP to opt out. Reply START to opt back in."}
+
+    def _messaging_allowed(self, c, merchant, guest_id, settings):
+        local = datetime.now(timezone.utc).astimezone(ZoneInfo(settings["timezone"]))
+        current, start, end = local.strftime("%H:%M"), settings["quiet_hours_start"], settings["quiet_hours_end"]
+        quiet = start <= current < end if start < end else current >= start or current < end
+        guest_count = c.execute("SELECT COUNT(*) n FROM outbound_messages WHERE merchant_id=? AND guest_id=? AND status IN ('sent','delivered') AND sent_at>=?", (merchant, guest_id, (datetime.now(timezone.utc)-timedelta(hours=24)).isoformat())).fetchone()["n"]
+        day_start = local.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat()
+        merchant_count = c.execute("SELECT COUNT(*) n FROM outbound_messages WHERE merchant_id=? AND status IN ('sent','delivered') AND sent_at>=?", (merchant, day_start)).fetchone()["n"]
+        return {"quiet_hours_clear": not quiet, "guest_frequency_clear": guest_count < settings["max_messages_per_guest_24h"], "merchant_frequency_clear": merchant_count < settings["max_messages_per_merchant_day"]}
+
     def dispatch_campaigns(self, merchant, limit=100):
         if not self.delivery: raise RuntimeError("message delivery is not configured")
         results = []
@@ -615,31 +644,112 @@ class OrbitService:
                         c.execute("UPDATE campaigns SET status='permission_revoked' WHERE id=?", (campaign["id"],)); results.append({"campaign_id": campaign["id"], "status": "permission_revoked"}); continue
                     if already_ordered:
                         c.execute("UPDATE campaigns SET status='stale_order_exists' WHERE id=?", (campaign["id"],)); results.append({"campaign_id": campaign["id"], "status": "stale_order_exists"}); continue
-                provider_id = self.delivery.send(campaign["channel"], recipient, campaign["subject"], campaign["body"])
+                    settings = self.messaging_settings(merchant)
+                    checks = self._messaging_allowed(c, merchant, campaign["guest_id"], settings)
+                    if not all(checks.values()): results.append({"campaign_id": campaign["id"], "status": "deferred", "checks": checks}); continue
+                    existing_message = c.execute("SELECT * FROM outbound_messages WHERE campaign_id=? ORDER BY created_at DESC LIMIT 1", (campaign["id"],)).fetchone()
+                    attempts = (existing_message["attempts"] if existing_message else 0) + 1
+                    if existing_message and existing_message["next_attempt_at"] and existing_message["next_attempt_at"] > now():
+                        results.append({"campaign_id": campaign["id"], "status": "retry_scheduled", "next_attempt_at": existing_message["next_attempt_at"]}); continue
+                    message_id = existing_message["id"] if existing_message else uid("msg")
+                    idempotency_key = existing_message["idempotency_key"] if existing_message else f"orbit-{campaign['id']}"
+                    provider = "telnyx" if campaign["channel"] == "sms" else "resend"
+                    if existing_message: c.execute("UPDATE outbound_messages SET status='sending',attempts=?,error=NULL WHERE id=?", (attempts, message_id))
+                    else: c.execute("""INSERT INTO outbound_messages(id,merchant_id,campaign_id,guest_id,channel,recipient,provider_message_id,status,error,sent_at,created_at,provider,attempts,next_attempt_at,last_event_at,dead_lettered_at,idempotency_key)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (message_id, merchant, campaign["id"], campaign["guest_id"], campaign["channel"], recipient, None, "sending", None, None, now(), provider, attempts, None, None, None, idempotency_key))
+                provider_id = self.delivery.send(campaign["channel"], recipient, campaign["subject"], campaign["body"], idempotency_key=idempotency_key)
                 with self.db.connect() as c:
                     c.execute("UPDATE campaigns SET status='sent',sent_at=? WHERE id=?", (now(), campaign["id"]))
-                    c.execute("INSERT INTO outbound_messages VALUES(?,?,?,?,?,?,?,?,?,?,?)", (uid("msg"), merchant, campaign["id"], campaign["guest_id"], campaign["channel"], recipient, provider_id, "sent", None, now(), now()))
+                    c.execute("UPDATE outbound_messages SET provider_message_id=?,status='sent',sent_at=?,next_attempt_at=NULL WHERE id=?", (provider_id, now(), message_id))
                 results.append({"campaign_id": campaign["id"], "status": "sent", "provider_message_id": provider_id})
             except Exception as error:
-                with self.db.connect() as c: c.execute("INSERT INTO outbound_messages VALUES(?,?,?,?,?,?,?,?,?,?,?)", (uid("msg"), merchant, campaign["id"], campaign["guest_id"], campaign["channel"], recipient or "", None, "failed", str(error), None, now()))
-                results.append({"campaign_id": campaign["id"], "status": "failed", "error": str(error)})
+                retryable = getattr(error, "retryable", True); max_attempts = max(1, int(__import__("os").getenv("ORBIT_MESSAGE_MAX_ATTEMPTS", "5")))
+                dead = not retryable or attempts >= max_attempts
+                retry_at = None if dead else (datetime.now(timezone.utc)+timedelta(seconds=min(3600, 30*(2**(attempts-1))))).isoformat()
+                with self.db.connect() as c:
+                    c.execute("UPDATE outbound_messages SET status=?,error=?,next_attempt_at=?,dead_lettered_at=? WHERE id=?", ("dead" if dead else "retrying", str(error), retry_at, now() if dead else None, message_id))
+                    if dead: c.execute("UPDATE campaigns SET status='delivery_failed' WHERE id=?", (campaign["id"],))
+                results.append({"campaign_id": campaign["id"], "status": "dead" if dead else "retrying", "next_attempt_at": retry_at, "error": str(error)})
         return {"messages": results}
+
+    def message_worker_loop(self, stop_event, interval=30):
+        """Dispatch approved campaigns and retry transient Telnyx/Resend failures."""
+        while not stop_event.is_set():
+            try:
+                with self.db.connect() as c: merchants = [row["id"] for row in c.execute("SELECT id FROM merchants")]
+                for merchant in merchants:
+                    try: self.dispatch_campaigns(merchant)
+                    except Exception as error: print(f"Message worker failed for {merchant}: {error}", flush=True)
+            except Exception as error: print(f"Message worker failed: {error}", flush=True)
+            stop_event.wait(interval)
+
+    def dead_letters(self, merchant):
+        with self.db.connect() as c:
+            rows = c.execute("""SELECT om.id,om.campaign_id,om.channel,om.recipient,om.provider,om.attempts,om.error,om.dead_lettered_at,c.subject
+                FROM outbound_messages om JOIN campaigns c ON c.id=om.campaign_id
+                WHERE om.merchant_id=? AND om.status='dead' ORDER BY om.dead_lettered_at DESC""", (merchant,)).fetchall()
+        return {"dead_letters": [dict(row) for row in rows]}
+
+    def retry_dead_letter(self, merchant, message_id):
+        with self.db.connect() as c:
+            message = c.execute("SELECT campaign_id FROM outbound_messages WHERE id=? AND merchant_id=? AND status='dead'", (message_id, merchant)).fetchone()
+            if not message: raise KeyError("dead-letter message not found")
+            c.execute("UPDATE outbound_messages SET status='retrying',attempts=0,next_attempt_at=?,dead_lettered_at=NULL,error=NULL WHERE id=?", (now(), message_id))
+            c.execute("UPDATE campaigns SET status='queued' WHERE id=?", (message["campaign_id"],))
+            self._audit(c, merchant, "message.dead_letter_retried", "outbound_message", message_id)
+        return {"id": message_id, "status": "retrying"}
 
     def record_message_event(self, merchant, data):
         event_type = data["event_type"].lower()
-        if event_type not in ("delivered", "opened", "clicked", "bounced", "failed", "unsubscribed"): raise ValueError("unsupported message event")
+        if event_type not in ("queued", "sent", "delivered", "opened", "clicked", "bounced", "complained", "failed", "unsubscribed"): raise ValueError("unsupported message event")
         with self.db.connect() as c:
             message = c.execute("SELECT id,guest_id,channel,campaign_id FROM outbound_messages WHERE merchant_id=? AND provider_message_id=?", (merchant, data["provider_message_id"])).fetchone()
             if not message: raise KeyError("message not found")
             event_id, occurred = uid("mse"), data.get("occurred_at", now())
             c.execute("INSERT OR IGNORE INTO message_events VALUES(?,?,?,?,?,?)", (event_id, merchant, message["id"], event_type, occurred, json.dumps(data.get("metadata", {}))))
-            if event_type in ("bounced", "failed"): c.execute("UPDATE outbound_messages SET status=?,error=? WHERE id=?", (event_type, data.get("error"), message["id"]))
-            elif event_type == "delivered": c.execute("UPDATE outbound_messages SET status='delivered' WHERE id=?", (message["id"],))
-            elif event_type == "unsubscribed":
+            if event_type in ("bounced", "complained", "failed"): c.execute("UPDATE outbound_messages SET status=?,error=?,last_event_at=? WHERE id=?", (event_type, data.get("error"), occurred, message["id"]))
+            elif event_type in ("queued", "sent", "delivered"): c.execute("UPDATE outbound_messages SET status=?,last_event_at=? WHERE id=?", (event_type, occurred, message["id"]))
+            if event_type in ("unsubscribed", "complained"):
                 c.execute("INSERT OR REPLACE INTO suppressions VALUES(?,?,?,?,?)", (merchant, message["guest_id"], message["channel"], "provider_unsubscribe", occurred))
                 c.execute("INSERT INTO consents VALUES(?,?,?,?,?,?,?,?)", (uid("con"), merchant, message["guest_id"], message["channel"], "denied", "provider-unsubscribe", "provider_unsubscribe", occurred))
                 c.execute("UPDATE campaign_outcomes SET unsubscribed=1 WHERE campaign_id=?", (message["campaign_id"],))
         return {"event_id": event_id, "status": "recorded"}
+
+    def record_provider_event(self, provider, event_id, event_type, provider_message_id, occurred_at=None, metadata=None):
+        occurred = occurred_at or now(); normalized = event_type.lower()
+        aliases = {"message.sent": "sent", "message.delivered": "delivered", "message.failed": "failed", "email.sent": "sent", "email.delivered": "delivered", "email.bounced": "bounced", "email.complained": "complained", "email.delivery_delayed": "queued"}
+        normalized = aliases.get(normalized, normalized)
+        with self.db.connect() as c:
+            existing = c.execute("SELECT status FROM provider_webhook_events WHERE provider=? AND provider_event_id=?", (provider, event_id)).fetchone()
+            if existing: return {"status": existing["status"], "duplicate": True}
+            c.execute("INSERT INTO provider_webhook_events VALUES(?,?,?,?,?,?,?,?,?)", (uid("pwe"), provider, event_id, event_type, json.dumps(metadata or {}), "processing", None, now(), None))
+            message = c.execute("SELECT merchant_id FROM outbound_messages WHERE provider=? AND provider_message_id=?", (provider, provider_message_id)).fetchone()
+        if not message:
+            with self.db.connect() as c: c.execute("UPDATE provider_webhook_events SET status='unmatched',processed_at=? WHERE provider=? AND provider_event_id=?", (now(), provider, event_id))
+            return {"status": "unmatched", "duplicate": False}
+        result = self.record_message_event(message["merchant_id"], {"provider_message_id": provider_message_id, "event_type": normalized, "occurred_at": occurred, "metadata": metadata or {}})
+        with self.db.connect() as c: c.execute("UPDATE provider_webhook_events SET status='processed',processed_at=? WHERE provider=? AND provider_event_id=?", (now(), provider, event_id))
+        return {**result, "duplicate": False}
+
+    def handle_inbound_sms(self, data):
+        text, sender = (data.get("text") or "").strip(), data.get("from")
+        keyword = text.upper().split()[0] if text else ""
+        if keyword not in {"STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT", "START", "UNSTOP", "HELP", "INFO"}:
+            return {"status": "ignored"}
+        with self.db.connect() as c:
+            guests = c.execute("SELECT id,merchant_id,terms_accepted_at FROM guests WHERE phone=?", (sender,)).fetchall()
+            changed = 0
+            for guest in guests:
+                if keyword in {"STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"}:
+                    c.execute("INSERT OR REPLACE INTO suppressions VALUES(?,?,?,?,?)", (guest["merchant_id"], guest["id"], "sms", "telnyx_stop", now()))
+                    c.execute("INSERT INTO consents VALUES(?,?,?,?,?,?,?,?)", (uid("con"), guest["merchant_id"], guest["id"], "sms", "denied", "telnyx-keyword", "telnyx_stop", now())); changed += 1
+                elif keyword in {"START", "UNSTOP"} and guest["terms_accepted_at"]:
+                    c.execute("DELETE FROM suppressions WHERE merchant_id=? AND guest_id=? AND channel='sms'", (guest["merchant_id"], guest["id"]))
+                    c.execute("INSERT INTO consents VALUES(?,?,?,?,?,?,?,?)", (uid("con"), guest["merchant_id"], guest["id"], "sms", "granted", "telnyx-keyword", "telnyx_start", now())); changed += 1
+        if keyword in {"HELP", "INFO"} and self.delivery:
+            help_text = __import__("os").getenv("ORBIT_SMS_HELP_TEXT", "OrbitGuest restaurant messages. Reply STOP to opt out. Reply START to opt back in.")
+            self.delivery.send("sms", sender, "", help_text, idempotency_key=f"help-{hashlib.sha256((sender+text).encode()).hexdigest()[:24]}")
+        return {"status": "processed", "keyword": keyword, "profiles_updated": changed}
 
     def _attribute(self, c, merchant, order_id, guest_id, occurred_at, revenue):
         if not guest_id: return

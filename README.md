@@ -36,7 +36,7 @@ without storing raw payment-card data.
   inventory/menu/margin/capacity/cooldown reality, supports an explicit do-nothing
   decision, and measures incremental lift with randomized control outcomes.
 - Provides configurable POS-location adapters, confirmed ingredient-to-menu recipe
-  links, OpenAI next-best-action predictions, real Twilio/Resend delivery, suppression,
+  links, OpenAI next-best-action predictions, real Telnyx/Resend delivery, suppression,
   and closed-loop POS revenue attribution.
 - Finds consented guests whose preferences match newly delivered ingredients.
 - Creates queued campaigns and attributes subsequent orders to those campaigns.
@@ -58,6 +58,7 @@ See [`docs/SQUARE.md`](docs/SQUARE.md) for the first native production POS integ
 See [`docs/DEMO.md`](docs/DEMO.md) for the strictly Sandbox-only behavior demo seeder.
 See [`docs/INTELLIGENCE.md`](docs/INTELLIGENCE.md) for recipe/inventory guardrails,
 prediction responsibilities, approvals, and evaluations.
+See [`docs/MESSAGING.md`](docs/MESSAGING.md) for Telnyx SMS and Resend email setup.
 
 For live email, configure Resend to send `email.received` events to
 `/v1/webhooks/resend`, then set `RESEND_API_KEY` and `RESEND_WEBHOOK_SECRET`.

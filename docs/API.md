@@ -100,9 +100,14 @@ favorite-item cadence, expected next item order, and frequent item combinations.
    incremental profit. `POST /v1/operations/state` supplies capacity, preparation time,
    and existing promotions. A new order before dispatch makes a campaign stale.
 7. **Delivery:** `POST /v1/campaigns/dispatch` sends due consented campaigns through
-   Twilio SMS or Resend email. `POST /v1/guests/{id}/suppress` blocks a channel and
+   Telnyx SMS or Resend email. `POST /v1/guests/{id}/suppress` blocks a channel and
    records denied consent. `POST /v1/messages/events` records delivered/opened/clicked,
    failed, bounced, and unsubscribe outcomes.
+   Signed provider callbacks use `POST /v1/webhooks/telnyx` and
+   `POST /v1/webhooks/resend`. `GET`/`POST /v1/messaging/settings` controls timezone,
+   quiet hours, per-guest frequency, merchant daily caps, and HELP text.
+   `GET /v1/messaging/dead-letters` lists terminal delivery failures and
+   `POST /v1/messaging/dead-letters/{message_id}/retry` retries one after review.
 8. **Incrementality:** eligible cohorts of at least 20 receive a deterministic randomized
    holdout controlled by `ORBIT_CONTROL_PERCENT` (default 10%). Purchases inside the
    prediction window update both messaged and control outcomes; only messaged purchases

@@ -35,9 +35,27 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/v1/webhooks/resend":
                 if not self.resend or not self.resend.verify(raw, {key.lower(): value for key, value in self.headers.items()}):
                     return self._send(401, {"error": "invalid Resend signature"})
-                if data.get("type") != "email.received": return self._send(200, {"status": "ignored"})
-                threading.Thread(target=self._process_resend, args=(data,), daemon=True).start()
-                return self._send(202, {"status": "accepted"})
+                if data.get("type") == "email.received":
+                    threading.Thread(target=self._process_resend, args=(data,), daemon=True).start()
+                    return self._send(202, {"status": "accepted"})
+                event_data = data.get("data") or {}
+                message_id = event_data.get("email_id") or event_data.get("id")
+                if not message_id: return self._send(200, {"status": "ignored"})
+                return self._send(200, self.service.record_provider_event("resend", self.headers.get("svix-id", data.get("id", message_id)), data.get("type", "unknown"), message_id, event_data.get("created_at"), event_data))
+            if path == "/v1/webhooks/telnyx":
+                headers = {key.lower(): value for key, value in self.headers.items()}
+                if not self.service.delivery or not self.service.delivery.verify_telnyx(raw, headers):
+                    return self._send(401, {"error": "invalid Telnyx signature"})
+                envelope, payload = data.get("data") or {}, (data.get("data") or {}).get("payload") or {}
+                event_type, event_id = envelope.get("event_type", "unknown"), envelope.get("id") or payload.get("id")
+                if event_type == "message.received":
+                    sender = (payload.get("from") or {}).get("phone_number")
+                    return self._send(200, self.service.handle_inbound_sms({"from": sender, "text": payload.get("text", "")}))
+                if not event_id or not payload.get("id"): return self._send(200, {"status": "ignored"})
+                if event_type == "message.finalized":
+                    statuses = [entry.get("status") for entry in payload.get("to", [])]
+                    event_type = "message.delivered" if "delivered" in statuses else "message.failed"
+                return self._send(200, self.service.record_provider_event("telnyx", event_id, event_type, payload.get("id"), envelope.get("occurred_at"), payload))
             if path == "/v1/webhooks/square":
                 if not self.square or not self.square.verify_webhook(raw, self.headers.get("X-Square-Hmacsha256-Signature")):
                     return self._send(401, {"error": "invalid Square signature"})
@@ -78,6 +96,8 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/v1/engine/run": result = self.service.run_behavior_engine(merchant)
             elif path == "/v1/campaigns/dispatch": result = self.service.dispatch_campaigns(merchant, data.get("limit", 100))
             elif path == "/v1/messages/events": result = self.service.record_message_event(merchant, data)
+            elif path == "/v1/messaging/settings": result = self.service.update_messaging_settings(merchant, data)
+            elif path.startswith("/v1/messaging/dead-letters/") and path.endswith("/retry"): result = self.service.retry_dead_letter(merchant, path.split("/")[4])
             elif path == "/v1/demo/behavior/seed": result = BehaviorDemoSeeder(self.service).seed(merchant)
             elif path.startswith("/v1/guests/") and path.endswith("/suppress"): result = self.service.suppress(merchant, path.split("/")[3], data["channel"], data.get("reason", "customer_opt_out"))
             else: return self._send(404, {"error": "not_found"})
@@ -104,6 +124,8 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/v1/dashboard/recipes": result = self.service.recipe_dashboard(merchant)
             elif path == "/v1/dashboard/inventory": result = self.service.inventory_dashboard(merchant)
             elif path == "/v1/dashboard/evaluations": result = self.service.evaluation_dashboard(merchant)
+            elif path == "/v1/messaging/settings": result = self.service.messaging_settings(merchant)
+            elif path == "/v1/messaging/dead-letters": result = self.service.dead_letters(merchant)
             elif path == "/v1/operations/state": result = self.service.operational_dashboard(merchant)
             elif path == "/v1/integrations/square/status": result = self.square.status(merchant)
             else: return self._send(404, {"error": "not_found"})
@@ -128,6 +150,9 @@ def main():
     behavior_worker_stop = threading.Event()
     behavior_interval = max(60, int(os.getenv("ORBIT_BEHAVIOR_INTERVAL_SECONDS", "900")))
     threading.Thread(target=Handler.service.behavior_worker_loop, args=(behavior_worker_stop, behavior_interval), daemon=True).start()
+    message_worker_stop = threading.Event()
+    message_interval = max(10, int(os.getenv("ORBIT_MESSAGE_INTERVAL_SECONDS", "30")))
+    threading.Thread(target=Handler.service.message_worker_loop, args=(message_worker_stop, message_interval), daemon=True).start()
     resend_key, resend_secret = os.getenv("RESEND_API_KEY"), os.getenv("RESEND_WEBHOOK_SECRET")
     Handler.resend = ResendInboundClient(resend_key, resend_secret) if resend_key and resend_secret else None
     ThreadingHTTPServer(("0.0.0.0", int(os.getenv("PORT", args.port))), Handler).serve_forever()

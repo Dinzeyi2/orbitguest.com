@@ -263,7 +263,24 @@ CREATE TABLE IF NOT EXISTS outbound_messages (
  id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
  guest_id TEXT NOT NULL, channel TEXT NOT NULL, recipient TEXT NOT NULL,
  provider_message_id TEXT, status TEXT NOT NULL, error TEXT,
- sent_at TEXT, created_at TEXT NOT NULL, FOREIGN KEY(campaign_id) REFERENCES campaigns(id)
+ sent_at TEXT, created_at TEXT NOT NULL, provider TEXT,
+ attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT, last_event_at TEXT,
+ dead_lettered_at TEXT, idempotency_key TEXT,
+ FOREIGN KEY(campaign_id) REFERENCES campaigns(id)
+);
+CREATE TABLE IF NOT EXISTS messaging_settings (
+ merchant_id TEXT PRIMARY KEY, timezone TEXT NOT NULL DEFAULT 'UTC',
+ quiet_hours_start TEXT NOT NULL DEFAULT '21:00', quiet_hours_end TEXT NOT NULL DEFAULT '08:00',
+ max_messages_per_guest_24h INTEGER NOT NULL DEFAULT 1,
+ max_messages_per_merchant_day INTEGER NOT NULL DEFAULT 100,
+ sms_help_text TEXT NOT NULL DEFAULT 'Reply STOP to opt out. Reply START to opt back in.',
+ updated_at TEXT NOT NULL, FOREIGN KEY(merchant_id) REFERENCES merchants(id)
+);
+CREATE TABLE IF NOT EXISTS provider_webhook_events (
+ id TEXT PRIMARY KEY, provider TEXT NOT NULL, provider_event_id TEXT NOT NULL,
+ event_type TEXT NOT NULL, payload_json TEXT NOT NULL, status TEXT NOT NULL,
+ error TEXT, received_at TEXT NOT NULL, processed_at TEXT,
+ UNIQUE(provider,provider_event_id)
 );
 CREATE TABLE IF NOT EXISTS message_events (
  id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, outbound_message_id TEXT NOT NULL,
@@ -309,6 +326,7 @@ CREATE INDEX IF NOT EXISTS idx_inventory_consumption_order ON inventory_consumpt
 CREATE INDEX IF NOT EXISTS idx_inventory_adjustment_product ON inventory_adjustments(merchant_id,product_id,occurred_at);
 CREATE INDEX IF NOT EXISTS idx_prediction_runs_merchant ON prediction_runs(merchant_id,component,created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_campaign ON outbound_messages(campaign_id,status);
+CREATE INDEX IF NOT EXISTS idx_messages_provider ON outbound_messages(provider,provider_message_id);
 """
 
 class Database:
@@ -359,6 +377,10 @@ class Database:
             prediction_columns = {row["name"] for row in connection.execute("PRAGMA table_info(predictions)")}
             for name, definition in (("action", "TEXT NOT NULL DEFAULT 'wait'"), ("expected_order_value_cents", "INTEGER"), ("return_probabilities_json", "TEXT NOT NULL DEFAULT '{}'"), ("time_window_start", "TEXT"), ("time_window_end", "TEXT"), ("predicted_basket_json", "TEXT NOT NULL DEFAULT '[]'"), ("do_not_contact", "INTEGER NOT NULL DEFAULT 0"), ("eligibility_json", "TEXT NOT NULL DEFAULT '{}'")):
                 if name not in prediction_columns: connection.execute(f"ALTER TABLE predictions ADD COLUMN {name} {definition}")
+            message_columns = {row["name"] for row in connection.execute("PRAGMA table_info(outbound_messages)")}
+            for name, definition in (("provider", "TEXT"), ("attempts", "INTEGER NOT NULL DEFAULT 0"), ("next_attempt_at", "TEXT"), ("last_event_at", "TEXT"), ("dead_lettered_at", "TEXT"), ("idempotency_key", "TEXT")):
+                if name not in message_columns: connection.execute(f"ALTER TABLE outbound_messages ADD COLUMN {name} {definition}")
+            connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_outbound_idempotency ON outbound_messages(idempotency_key) WHERE idempotency_key IS NOT NULL")
             recipe_columns = {row["name"] for row in connection.execute("PRAGMA table_info(recipe_links)")}
             for name, definition in (("waste_percent", "REAL NOT NULL DEFAULT 0"), ("yield_percent", "REAL NOT NULL DEFAULT 100"), ("packaging_cost_cents", "INTEGER NOT NULL DEFAULT 0"), ("substitution_group", "TEXT"), ("confirmed_by", "TEXT"), ("confirmed_at", "TEXT")):
                 if name not in recipe_columns: connection.execute(f"ALTER TABLE recipe_links ADD COLUMN {name} {definition}")

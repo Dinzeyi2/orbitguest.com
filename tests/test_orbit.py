@@ -9,6 +9,7 @@ from orbit.resend import ResendInboundClient
 from orbit.square import SquareIntegration, SquareClient
 from orbit.demo import BehaviorDemoSeeder, DemoSeedError
 from orbit.prediction import OpenAIBehaviorPredictor
+from orbit.messaging import MessageDelivery, DeliveryError
 import hashlib
 import hmac
 import json
@@ -39,8 +40,13 @@ class CapturingPredictor(FakePredictor):
 
 class FakeDelivery:
     def __init__(self): self.sent = []
-    def send(self, channel, to, subject, body):
+    def send(self, channel, to, subject, body, idempotency_key=None):
         self.sent.append((channel, to, subject, body)); return "provider-message-1"
+
+class FailingDelivery:
+    def __init__(self, retryable=True): self.retryable, self.calls = retryable, 0
+    def send(self, *args, **kwargs):
+        self.calls += 1; raise DeliveryError("provider unavailable", self.retryable)
 
 class FakeResend(ResendInboundClient):
     def _json(self, path):
@@ -63,6 +69,13 @@ class OrbitFlowTest(unittest.TestCase):
 
     def order(self, external, when="2026-08-10T18:00:00+00:00"):
         return self.service.ingest_order(self.merchant, {"external_id": external, "source": "square", "payment_fingerprint": "tok_guest_1", "occurred_at": when, "total_cents": 3200, "items": [{"name": "Smoked Ribs", "quantity": 1, "unit_price_cents": 3200}]})
+
+    def queued_campaign(self, guest_id, campaign_id="campaign-test"):
+        stamp = datetime.now(timezone.utc).isoformat()
+        with self.service.db.connect() as connection:
+            connection.execute("""INSERT INTO campaigns(id,merchant_id,guest_id,channel,trigger_type,trigger_ref,subject,body,status,scheduled_at,sent_at,created_at,action,control_group,prediction_window_end,eligibility_json)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (campaign_id, self.merchant, guest_id, "sms", "next_visit", "prediction-test", "Your favorite", "Your favorite is available. Reply STOP to opt out.", "queued", stamp, None, stamp, "send_sms", 0, None, "{}"))
+        return campaign_id
 
     def test_closed_loop_from_pos_to_invoice_campaign_and_revenue(self):
         for index, stamp in enumerate(("2026-05-18", "2026-06-01", "2026-06-15", "2026-06-29", "2026-07-13", "2026-07-27", "2026-08-10")):
@@ -303,6 +316,8 @@ class OrbitFlowTest(unittest.TestCase):
         self.service.run_behavior_engine(self.merchant)
         campaign = self.service.list_campaigns(self.merchant)[0]
         self.service.approve_campaign(self.merchant, campaign["id"])
+        hour = datetime.now(timezone.utc).hour
+        self.service.update_messaging_settings(self.merchant, {"timezone": "UTC", "quiet_hours_start": f"{(hour+1)%24:02d}:00", "quiet_hours_end": f"{(hour+2)%24:02d}:00"})
         dispatched = self.service.dispatch_campaigns(self.merchant)
         self.assertEqual(dispatched["messages"][0]["status"], "sent")
         self.assertEqual(delivery.sent[0][0], "sms")
@@ -456,6 +471,12 @@ class OrbitFlowTest(unittest.TestCase):
         start = (Path(__file__).parents[1] / "Procfile").read_text()
         self.assertIn("python scripts/check_runtime.py", start)
 
+    def test_live_messaging_runtime_check_requires_telnyx_and_resend_configuration(self):
+        from scripts.check_runtime import main as check_runtime
+        with patch.dict(os.environ, {"ORBIT_ENABLE_LIVE_MESSAGING": "true", "TELNYX_API_KEY": ""}, clear=False):
+            with self.assertRaises(SystemExit) as raised: check_runtime()
+        self.assertIn("TELNYX_API_KEY", str(raised.exception))
+
     def test_behavior_demo_seeder_is_sandbox_only_and_builds_realistic_profiles(self):
         seeder = BehaviorDemoSeeder(self.service)
         with patch.dict(os.environ, {"SQUARE_ENVIRONMENT": "production", "ORBIT_DEMO_MODE": "true"}):
@@ -566,5 +587,85 @@ class OrbitFlowTest(unittest.TestCase):
         self.assertEqual(request.call_count, 2)
         self.assertTrue(predictor.last_run_metadata["fallback"])
         self.assertEqual(predictor.last_run_metadata["prompt_version"], "strategy-v2")
+
+    def test_telnyx_replaces_twilio_and_uses_bearer_json_api(self):
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+            def read(self): return b'{"data":{"id":"telnyx-message-1"}}'
+        with patch.dict(os.environ, {"TELNYX_API_KEY": "KEY", "TELNYX_FROM_NUMBER": "+15550000000", "TELNYX_MESSAGING_PROFILE_ID": "profile-1", "TELNYX_ALLOWED_COUNTRY_PREFIXES": "+1"}, clear=False):
+            delivery = MessageDelivery()
+        with patch("urllib.request.urlopen", return_value=Response()) as urlopen:
+            message_id = delivery.send("sms", "+15550001111", "", "Hello. Reply STOP to opt out.", idempotency_key="orbit-campaign-1")
+        self.assertEqual(message_id, "telnyx-message-1")
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "https://api.telnyx.com/v2/messages")
+        self.assertEqual(request.get_header("Authorization"), "Bearer KEY")
+        self.assertEqual(request.get_header("Idempotency-key"), "orbit-campaign-1")
+        payload = json.loads(request.data)
+        self.assertEqual(payload["messaging_profile_id"], "profile-1")
+        self.assertNotIn("TWILIO", str(request.header_items()).upper())
+
+    def test_telnyx_webhook_signature_stop_start_help_and_delivery_sync(self):
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        private = Ed25519PrivateKey.generate(); public = private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        with patch.dict(os.environ, {"TELNYX_PUBLIC_KEY": base64.b64encode(public).decode()}): delivery = MessageDelivery()
+        raw, timestamp = b'{"data":{"event_type":"message.delivered"}}', str(int(time.time()))
+        signature = base64.b64encode(private.sign(timestamp.encode() + b"|" + raw)).decode()
+        self.assertTrue(delivery.verify_telnyx(raw, {"telnyx-signature-ed25519": signature, "telnyx-timestamp": timestamp}))
+        self.assertFalse(delivery.verify_telnyx(raw + b" ", {"telnyx-signature-ed25519": signature, "telnyx-timestamp": timestamp}))
+
+        self.order("sms-identity")
+        guest = self.service.capture_identity(self.merchant, {"payment_fingerprint": "tok_guest_1", "phone": "+15550001111", "terms": {"accepted": True, "version": "v1"}, "consent": {"sms": {"status": "granted", "disclosure_version": "v1"}}})
+        self.assertEqual(self.service.handle_inbound_sms({"from": "+15550001111", "text": "STOP"})["profiles_updated"], 1)
+        with self.service.db.connect() as connection: self.assertEqual(connection.execute("SELECT COUNT(*) n FROM suppressions WHERE guest_id=? AND channel='sms'", (guest["id"],)).fetchone()["n"], 1)
+        self.assertEqual(self.service.handle_inbound_sms({"from": "+15550001111", "text": "START"})["profiles_updated"], 1)
+        with self.service.db.connect() as connection: self.assertEqual(connection.execute("SELECT COUNT(*) n FROM suppressions WHERE guest_id=? AND channel='sms'", (guest["id"],)).fetchone()["n"], 0)
+        self.service.delivery = FakeDelivery(); self.service.handle_inbound_sms({"from": "+15550001111", "text": "HELP"})
+        self.assertIn("STOP", self.service.delivery.sent[0][3])
+
+        campaign = self.queued_campaign(guest["id"], "campaign-event")
+        stamp = datetime.now(timezone.utc).isoformat()
+        with self.service.db.connect() as connection:
+            connection.execute("""INSERT INTO outbound_messages(id,merchant_id,campaign_id,guest_id,channel,recipient,provider_message_id,status,error,sent_at,created_at,provider,attempts,next_attempt_at,last_event_at,dead_lettered_at,idempotency_key)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", ("message-event", self.merchant, campaign, guest["id"], "sms", "+15550001111", "telnyx-event-1", "sent", None, stamp, stamp, "telnyx", 1, None, None, None, "orbit-event"))
+        result = self.service.record_provider_event("telnyx", "event-1", "message.delivered", "telnyx-event-1", stamp, {})
+        self.assertFalse(result["duplicate"])
+        self.assertTrue(self.service.record_provider_event("telnyx", "event-1", "message.delivered", "telnyx-event-1", stamp, {})["duplicate"])
+        with self.service.db.connect() as connection: self.assertEqual(connection.execute("SELECT status FROM outbound_messages WHERE id='message-event'").fetchone()["status"], "delivered")
+        with self.service.db.connect() as connection: connection.execute("UPDATE outbound_messages SET provider='resend',provider_message_id='resend-event-1',channel='email' WHERE id='message-event'")
+        self.service.record_provider_event("resend", "email-complaint-1", "email.complained", "resend-event-1", stamp, {})
+        with self.service.db.connect() as connection: self.assertEqual(connection.execute("SELECT COUNT(*) n FROM suppressions WHERE guest_id=? AND channel='email'", (guest["id"],)).fetchone()["n"], 1)
+
+    def test_quiet_hours_frequency_caps_and_delivery_dead_letter(self):
+        self.order("retry-identity")
+        guest = self.service.capture_identity(self.merchant, {"payment_fingerprint": "tok_guest_1", "phone": "+15550002222", "terms": {"accepted": True, "version": "v1"}, "consent": {"sms": {"status": "granted", "disclosure_version": "v1"}}})
+        self.queued_campaign(guest["id"], "campaign-retry")
+        current = datetime.now(timezone.utc)
+        self.service.update_messaging_settings(self.merchant, {"timezone": "UTC", "quiet_hours_start": current.strftime("%H:%M"), "quiet_hours_end": (current+__import__("datetime").timedelta(hours=1)).strftime("%H:%M")})
+        self.service.delivery = FakeDelivery()
+        self.assertEqual(self.service.dispatch_campaigns(self.merchant)["messages"][0]["status"], "deferred")
+        self.service.update_messaging_settings(self.merchant, {"timezone": "UTC", "quiet_hours_start": f"{(current.hour+1)%24:02d}:00", "quiet_hours_end": f"{(current.hour+2)%24:02d}:00"})
+        stamp = current.isoformat()
+        with self.service.db.connect() as connection:
+            connection.execute("""INSERT INTO outbound_messages(id,merchant_id,campaign_id,guest_id,channel,recipient,provider_message_id,status,error,sent_at,created_at,provider,attempts,next_attempt_at,last_event_at,dead_lettered_at,idempotency_key)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", ("frequency-message", self.merchant, "campaign-retry", guest["id"], "sms", "+15550002222", "frequency-provider", "sent", None, stamp, stamp, "telnyx", 1, None, None, None, "frequency-key"))
+            checks = self.service._messaging_allowed(connection, self.merchant, guest["id"], self.service.messaging_settings(self.merchant))
+            connection.execute("DELETE FROM outbound_messages WHERE id='frequency-message'")
+        self.assertFalse(checks["guest_frequency_clear"])
+        self.service.delivery = FailingDelivery(retryable=True)
+        with patch.dict(os.environ, {"ORBIT_MESSAGE_MAX_ATTEMPTS": "2"}):
+            first = self.service.dispatch_campaigns(self.merchant)["messages"][0]
+            self.assertEqual(first["status"], "retrying")
+            with self.service.db.connect() as connection: connection.execute("UPDATE outbound_messages SET next_attempt_at=? WHERE campaign_id=?", ((current-__import__("datetime").timedelta(minutes=1)).isoformat(), "campaign-retry"))
+            second = self.service.dispatch_campaigns(self.merchant)["messages"][0]
+        self.assertEqual(second["status"], "dead")
+        with self.service.db.connect() as connection:
+            message = connection.execute("SELECT status,attempts,dead_lettered_at FROM outbound_messages WHERE campaign_id='campaign-retry'").fetchone()
+        self.assertEqual(message["status"], "dead"); self.assertEqual(message["attempts"], 2); self.assertIsNotNone(message["dead_lettered_at"])
+        dead = self.service.dead_letters(self.merchant)["dead_letters"]
+        self.assertEqual(len(dead), 1)
+        self.assertEqual(self.service.retry_dead_letter(self.merchant, dead[0]["id"])["status"], "retrying")
 
 if __name__ == "__main__": unittest.main()
