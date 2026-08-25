@@ -487,11 +487,26 @@ class OrbitFlowTest(unittest.TestCase):
             locations = connection.execute("SELECT COUNT(DISTINCT location_id) count FROM orders WHERE external_id LIKE 'demo-%'").fetchone()["count"]
             fulfillments = connection.execute("SELECT COUNT(DISTINCT fulfillment_type) count FROM orders WHERE external_id LIKE 'demo-%'").fetchone()["count"]
             discounts = connection.execute("SELECT COUNT(*) count FROM orders WHERE external_id LIKE 'demo-%' AND discount_cents>0").fetchone()["count"]
+            jordan = next(profile for profile in result["created_profiles"] if profile["label"] == "jordan")
+            jordan_prediction = connection.execute("SELECT * FROM predictions WHERE guest_id=? AND normalized_item='classic burger' ORDER BY created_at DESC LIMIT 1", (jordan["guest_id"],)).fetchone()
+            jordan_campaign = connection.execute("SELECT * FROM campaigns WHERE guest_id=? ORDER BY created_at DESC LIMIT 1", (jordan["guest_id"],)).fetchone()
         self.assertEqual(canceled["status"], "canceled")
         self.assertGreater(modifiers, 0)
         self.assertGreaterEqual(locations, 2)
         self.assertGreaterEqual(fulfillments, 3)
         self.assertGreater(discounts, 0)
+        self.assertIsNotNone(jordan_prediction)
+        eligibility = json.loads(jordan_prediction["eligibility_json"])
+        for check in ("authorized_channel", "not_suppressed", "cooldown_clear", "menu_and_recipe_confirmed", "estimated_inventory_available", "capacity_available", "positive_expected_incremental_profit"):
+            self.assertTrue(eligibility[check], check)
+        self.assertIsNotNone(jordan_campaign)
+        self.assertEqual(jordan_campaign["status"], "approval_required")
+        self.assertEqual(jordan_campaign["action"], "send_sms")
+        self.assertIn("Classic Burger", jordan_campaign["body"])
+        self.assertIn("STOP", jordan_campaign["body"])
+        self.assertNotIn("discount", jordan_campaign["body"].lower())
+        self.assertNotIn("% off", jordan_campaign["body"].lower())
+        self.assertGreaterEqual(result["profiles"]["profile_count"] - result["profiles"]["identified_count"], 10)
 
     def test_recipe_inventory_reconciles_sales_refunds_waste_and_margin(self):
         invoice = self.service.ingest_invoice(self.merchant, {"external_id": "stock-1", "vendor": "Butcher", "invoice_date": "2026-07-01", "total_cents": 90000, "items": [{"sku": "RIB", "ingredient": "Ribs", "quantity": 100, "unit": "lb", "unit_cost_cents": 900, "line_total_cents": 90000}]})

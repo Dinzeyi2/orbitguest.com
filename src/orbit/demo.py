@@ -8,6 +8,27 @@ class DemoSeedError(RuntimeError):
     pass
 
 
+class DemoBehaviorPredictor:
+    """Guarantee one reviewable staging decision while preserving the real predictor."""
+
+    def __init__(self, delegate):
+        self.delegate = delegate
+
+    def predict(self, context):
+        favorites = context.get("favorite_items") or []
+        favorite = favorites[0].get("display_name", "") if favorites else ""
+        if favorite.lower() == "classic burger":
+            send_at = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0).isoformat()
+            return [{
+                "type": "next_visit", "item": "Classic Burger", "score": .9,
+                "reason": "Strong recurring burger pattern with confirmed availability",
+                "send_at": send_at, "subject": "Your burger favorite is available",
+                "message": "Your Classic Burger favorite is available. Want us to have it ready for your next visit? Reply STOP to opt out.",
+                "action": "send_sms", "do_not_contact": False,
+            }]
+        return self.delegate.predict(context) if self.delegate else []
+
+
 class BehaviorDemoSeeder:
     ITEMS = {
         "ribs": ("Smoked Ribs", 2800, [{"name": "Spicy BBQ"}]),
@@ -92,12 +113,22 @@ class BehaviorDemoSeeder:
         for position, label in enumerate(("alex", "sarah", "jordan", "taylor")):
             self.service.capture_identity(merchant, {"payment_fingerprint": f"demo-fp-{label}", "name": label.title(), "phone": f"+15550001{position:02d}", "terms": {"accepted": True, "version": "demo-v1", "source": "demo_receipt"}, "consent": {"sms": {"status": "granted" if position < 3 else "denied", "disclosure_version": "demo-sms-v1", "source": "demo_receipt"}}})
 
-        invoice = self.service.ingest_invoice(merchant, {"external_id": "demo-ribs-delivery", "vendor": "Demo Foods", "invoice_date": now.date().isoformat(), "currency": "USD", "total_cents": 12000, "items": [{"sku": "DEMO-RIB", "ingredient": "Ribs", "quantity": 100, "unit": "portion", "unit_cost_cents": 900, "line_total_cents": 90000}]})
-        product = next(product for product in self.service.product_dashboard(merchant)["products"] if product["sku"] == "DEMO-RIB")
+        invoice = self.service.ingest_invoice(merchant, {"external_id": "demo-ribs-delivery", "vendor": "Demo Foods", "invoice_date": now.date().isoformat(), "currency": "USD", "total_cents": 144000, "items": [{"sku": "DEMO-RIB", "ingredient": "Ribs", "quantity": 100, "unit": "portion", "unit_cost_cents": 900, "line_total_cents": 90000}, {"sku": "DEMO-BURGER", "ingredient": "Burger Patties", "quantity": 120, "unit": "portion", "unit_cost_cents": 450, "line_total_cents": 54000}]})
+        products = self.service.product_dashboard(merchant)["products"]
+        product = next(product for product in products if product["sku"] == "DEMO-RIB")
         ribs_menu = self.service.upsert_menu_item(merchant, {"external_id": "demo-ribs", "name": "Smoked Ribs", "price_cents": 2800})
         self.service.link_recipe(merchant, {"product_id": product["id"], "menu_item_id": ribs_menu["id"], "quantity_required": 1, "unit": "portion", "confidence": 1})
+        burger_product = next(product for product in products if product["sku"] == "DEMO-BURGER")
+        burger_menu = self.service.upsert_menu_item(merchant, {"external_id": "demo-burger", "name": "Classic Burger", "price_cents": 1800})
+        self.service.link_recipe(merchant, {"product_id": burger_product["id"], "menu_item_id": burger_menu["id"], "quantity_required": 1, "unit": "portion", "confidence": 1, "packaging_cost_cents": 50})
         self.service.update_operational_state(merchant, {"accepting_orders": True, "capacity_remaining": 40, "preparation_minutes": 25, "promotions": []})
-        engine = self.service.run_behavior_engine(merchant)
+        self.service.set_campaign_policy(merchant, {"mode": "pilot", "automation_threshold": .85, "max_discount_cents": 0, "minimum_inventory_confidence": .8, "minimum_margin_cents": 500})
+        predictor = self.service.predictor
+        self.service.predictor = DemoBehaviorPredictor(predictor)
+        try:
+            engine = self.service.run_behavior_engine(merchant)
+        finally:
+            self.service.predictor = predictor
         dashboard = self.service.behavior_dashboard(merchant)
         predictions = self.service.prediction_dashboard(merchant)["predictions"]
         with self.service.db.connect() as connection:
