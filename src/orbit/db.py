@@ -105,6 +105,54 @@ CREATE TABLE IF NOT EXISTS behavior_profiles (
  updated_at TEXT NOT NULL,
  FOREIGN KEY(guest_id) REFERENCES guests(id)
 );
+CREATE TABLE IF NOT EXISTS behavior_context_signals (
+ id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, location_id TEXT,
+ signal_type TEXT NOT NULL, starts_at TEXT NOT NULL, ends_at TEXT NOT NULL,
+ value_json TEXT NOT NULL, source TEXT NOT NULL, confidence REAL NOT NULL,
+ created_at TEXT NOT NULL, FOREIGN KEY(merchant_id) REFERENCES merchants(id)
+);
+CREATE TABLE IF NOT EXISTS behavior_psychology_profiles (
+ guest_id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL,
+ routine_state TEXT NOT NULL, decision_window_start TEXT, decision_window_end TEXT,
+ social_probability REAL NOT NULL, convenience_affinity REAL NOT NULL,
+ novelty_affinity REAL NOT NULL, value_affinity REAL NOT NULL,
+ recognition_affinity REAL NOT NULL, pay_cycle_affinity REAL NOT NULL,
+ context_affinities_json TEXT NOT NULL, belonging_label TEXT,
+ recommended_mechanism TEXT NOT NULL, controlled_novelty INTEGER NOT NULL DEFAULT 0,
+ recommended_strategy TEXT NOT NULL DEFAULT 'habit_cue',
+ marketing_fatigue_json TEXT NOT NULL DEFAULT '{}', friction_sensitivity_json TEXT NOT NULL DEFAULT '{}',
+ evidence_json TEXT NOT NULL, updated_at TEXT NOT NULL,
+ FOREIGN KEY(guest_id) REFERENCES guests(id)
+);
+CREATE TABLE IF NOT EXISTS psychological_hypotheses (
+ guest_id TEXT NOT NULL, merchant_id TEXT NOT NULL, hypothesis_type TEXT NOT NULL,
+ state TEXT NOT NULL, confidence REAL NOT NULL, supporting_evidence_json TEXT NOT NULL,
+ contradicting_evidence_json TEXT NOT NULL, observation_count INTEGER NOT NULL,
+ experiment_count INTEGER NOT NULL DEFAULT 0, last_observed_at TEXT,
+ last_tested_at TEXT, model_version TEXT NOT NULL, evidence_status TEXT NOT NULL,
+ updated_at TEXT NOT NULL, PRIMARY KEY(guest_id,hypothesis_type),
+ FOREIGN KEY(guest_id) REFERENCES guests(id)
+);
+CREATE TABLE IF NOT EXISTS psychology_strategies (
+ code TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL,
+ requires_json TEXT NOT NULL, risk_level TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+ version TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS psychology_experiments (
+ id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, guest_id TEXT NOT NULL,
+ campaign_id TEXT NOT NULL UNIQUE, strategy_code TEXT NOT NULL, variant TEXT NOT NULL,
+ control_group INTEGER NOT NULL DEFAULT 0, assigned_at TEXT NOT NULL,
+ converted INTEGER NOT NULL DEFAULT 0, incremental_profit_cents INTEGER,
+ order_value_cents INTEGER, seconds_to_order INTEGER, unsubscribed INTEGER NOT NULL DEFAULT 0,
+ evaluated_at TEXT, FOREIGN KEY(campaign_id) REFERENCES campaigns(id),
+ FOREIGN KEY(strategy_code) REFERENCES psychology_strategies(code)
+);
+CREATE TABLE IF NOT EXISTS behavior_interactions (
+ id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, guest_id TEXT NOT NULL,
+ campaign_id TEXT, event_type TEXT NOT NULL, metadata_json TEXT NOT NULL,
+ occurred_at TEXT NOT NULL, created_at TEXT NOT NULL,
+ FOREIGN KEY(guest_id) REFERENCES guests(id)
+);
 CREATE TABLE IF NOT EXISTS guest_item_affinities (
  guest_id TEXT NOT NULL, normalized_item TEXT NOT NULL, display_name TEXT NOT NULL,
  order_count INTEGER NOT NULL, total_quantity REAL NOT NULL, last_ordered_at TEXT NOT NULL,
@@ -257,6 +305,8 @@ CREATE TABLE IF NOT EXISTS campaigns (
  status TEXT NOT NULL, scheduled_at TEXT NOT NULL, sent_at TEXT, created_at TEXT NOT NULL,
  action TEXT NOT NULL DEFAULT 'send_message', control_group INTEGER NOT NULL DEFAULT 0,
  prediction_window_end TEXT, eligibility_json TEXT NOT NULL DEFAULT '{}',
+ psychology_mechanism TEXT,
+ psychology_strategy TEXT,
  FOREIGN KEY(guest_id) REFERENCES guests(id)
 );
 CREATE TABLE IF NOT EXISTS outbound_messages (
@@ -317,6 +367,11 @@ CREATE INDEX IF NOT EXISTS idx_documents_email ON invoice_documents(inbound_emai
 CREATE INDEX IF NOT EXISTS idx_products_merchant ON catalog_products(merchant_id, vendor, normalized_name);
 CREATE INDEX IF NOT EXISTS idx_product_versions_history ON product_versions(product_id, effective_date DESC, recorded_at DESC);
 CREATE INDEX IF NOT EXISTS idx_behavior_merchant ON behavior_profiles(merchant_id, behavior_status);
+CREATE INDEX IF NOT EXISTS idx_behavior_context ON behavior_context_signals(merchant_id,starts_at,ends_at);
+CREATE INDEX IF NOT EXISTS idx_psychology_merchant ON behavior_psychology_profiles(merchant_id,routine_state,recommended_mechanism);
+CREATE INDEX IF NOT EXISTS idx_hypotheses_merchant ON psychological_hypotheses(merchant_id,hypothesis_type,confidence);
+CREATE INDEX IF NOT EXISTS idx_psych_experiments ON psychology_experiments(merchant_id,strategy_code,assigned_at);
+CREATE INDEX IF NOT EXISTS idx_behavior_interactions ON behavior_interactions(merchant_id,guest_id,event_type,occurred_at);
 CREATE INDEX IF NOT EXISTS idx_predictions_merchant ON predictions(merchant_id, status, recommended_send_at);
 CREATE INDEX IF NOT EXISTS idx_pos_connections ON pos_connections(merchant_id,provider,status);
 CREATE INDEX IF NOT EXISTS idx_square_events_status ON square_webhook_events(status,received_at);
@@ -358,6 +413,9 @@ class Database:
             for name, definition in (("interval_stddev_days", "REAL"), ("days_since_last_visit", "REAL"), ("overdue_by_days", "REAL"), ("weekday_distribution_json", "TEXT NOT NULL DEFAULT '{}'"), ("hour_distribution_json", "TEXT NOT NULL DEFAULT '{}'")):
                 if name not in behavior_columns:
                     connection.execute(f"ALTER TABLE behavior_profiles ADD COLUMN {name} {definition}")
+            psychology_columns = {row["name"] for row in connection.execute("PRAGMA table_info(behavior_psychology_profiles)")}
+            for name, definition in (("recommended_strategy", "TEXT NOT NULL DEFAULT 'habit_cue'"), ("marketing_fatigue_json", "TEXT NOT NULL DEFAULT '{}'"), ("friction_sensitivity_json", "TEXT NOT NULL DEFAULT '{}'")):
+                if name not in psychology_columns: connection.execute(f"ALTER TABLE behavior_psychology_profiles ADD COLUMN {name} {definition}")
             affinity_columns = {row["name"] for row in connection.execute("PRAGMA table_info(guest_item_affinities)")}
             for name, definition in (("total_spend_cents", "INTEGER NOT NULL DEFAULT 0"), ("average_interval_days", "REAL"), ("preferred_weekday", "INTEGER"), ("preferred_hour", "INTEGER"), ("predicted_next_order_at", "TEXT")):
                 if name not in affinity_columns:
@@ -373,6 +431,10 @@ class Database:
             campaign_columns = {row["name"] for row in connection.execute("PRAGMA table_info(campaigns)")}
             for name, definition in (("action", "TEXT NOT NULL DEFAULT 'send_message'"), ("control_group", "INTEGER NOT NULL DEFAULT 0"), ("prediction_window_end", "TEXT"), ("eligibility_json", "TEXT NOT NULL DEFAULT '{}'")):
                 if name not in campaign_columns: connection.execute(f"ALTER TABLE campaigns ADD COLUMN {name} {definition}")
+            if "psychology_mechanism" not in campaign_columns:
+                connection.execute("ALTER TABLE campaigns ADD COLUMN psychology_mechanism TEXT")
+            if "psychology_strategy" not in campaign_columns:
+                connection.execute("ALTER TABLE campaigns ADD COLUMN psychology_strategy TEXT")
             prediction_columns = {row["name"] for row in connection.execute("PRAGMA table_info(predictions)")}
             for name, definition in (("action", "TEXT NOT NULL DEFAULT 'wait'"), ("expected_order_value_cents", "INTEGER"), ("return_probabilities_json", "TEXT NOT NULL DEFAULT '{}'"), ("time_window_start", "TEXT"), ("time_window_end", "TEXT"), ("predicted_basket_json", "TEXT NOT NULL DEFAULT '[]'"), ("do_not_contact", "INTEGER NOT NULL DEFAULT 0"), ("eligibility_json", "TEXT NOT NULL DEFAULT '{}'")):
                 if name not in prediction_columns: connection.execute(f"ALTER TABLE predictions ADD COLUMN {name} {definition}")

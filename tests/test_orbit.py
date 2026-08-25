@@ -90,6 +90,9 @@ class OrbitFlowTest(unittest.TestCase):
         self.service.predictor = FakePredictor(); self.service.run_behavior_engine(self.merchant)
         campaign = self.service.list_campaigns(self.merchant)[0]
         self.assertEqual(campaign["channel"], "sms")
+        self.assertIsNotNone(campaign["psychology_strategy"])
+        psychology_experiments = self.service.psychology_dashboard(self.merchant)["experiments"]
+        self.assertEqual(psychology_experiments[0]["campaign_id"], campaign["id"])
         inventory_prediction = self.service.prediction_dashboard(self.merchant)["predictions"][0]
         self.assertEqual(inventory_prediction["prediction_type"], "next_visit")
         self.assertEqual(inventory_prediction["status"], "eligible")
@@ -97,6 +100,7 @@ class OrbitFlowTest(unittest.TestCase):
         self.service.mark_sent(self.merchant, campaign["id"])
         self.order("order-return", datetime.now(timezone.utc).isoformat())
         self.assertEqual(self.service.metrics(self.merchant)["revenue_cents"], 3200)
+        self.assertEqual(self.service.psychology_dashboard(self.merchant)["experiments"][0]["converted"], 1)
 
     def test_opted_out_guest_is_not_messaged(self):
         self.order("one"); self.order("two")
@@ -249,6 +253,45 @@ class OrbitFlowTest(unittest.TestCase):
         self.assertEqual(self.service.run_behavior_engine(self.merchant)["predictions_created"], 0)
         self.assertEqual(len(predictor.contexts), 1)
         self.assertEqual(self.service.prediction_dashboard(self.merchant)["predictions"][0]["status"], "do_not_contact")
+
+    def test_behavior_psychology_learns_context_social_pattern_and_decision_mechanism(self):
+        dates = ("2026-06-07", "2026-06-21", "2026-07-05", "2026-07-19", "2026-08-02", "2026-08-16")
+        for index, stamp in enumerate(dates):
+            self.service.ingest_order(self.merchant, {"external_id": f"psych-{index}", "source": "square", "payment_fingerprint": "psych-card", "occurred_at": f"{stamp}T18:00:00+00:00", "total_cents": 4200, "discount_cents": 500 if index % 2 == 0 else 0, "fulfillment_type": "pickup", "items": [{"name": "Rib Plate", "quantity": 2, "unit_price_cents": 1800}, {"name": "Mac and Cheese", "quantity": 1, "unit_price_cents": 600}]})
+        self.service.record_behavior_context(self.merchant, {"signal_type": "sporting_event", "starts_at": "2026-07-19T16:00:00+00:00", "ends_at": "2026-07-19T22:00:00+00:00", "source": "league_schedule", "confidence": 1, "value": {"event": "home game"}})
+        with self.service.db.connect() as connection: guest_id = connection.execute("SELECT id FROM guests WHERE payment_fingerprint='psych-card'").fetchone()["id"]
+        self.service.record_behavior_interaction(self.merchant, {"guest_id": guest_id, "event_type": "checkout_started"})
+        self.service.record_behavior_interaction(self.merchant, {"guest_id": guest_id, "event_type": "checkout_abandoned"})
+        self.service.run_behavior_engine(self.merchant)
+        psychology = self.service.behavior_dashboard(self.merchant)["customers"][0]["psychology"]
+        self.assertGreater(psychology["social_probability"], .5)
+        self.assertGreater(psychology["convenience_affinity"], .5)
+        self.assertEqual(psychology["belonging_label"], "Sunday Regular")
+        self.assertIn(psychology["routine_state"], {"approaching", "decision_window", "disrupted", "passed"})
+        self.assertGreater(psychology["context_affinities"]["sporting_event"], 0)
+        self.assertTrue(psychology["evidence"]["pay_cycle_is_calendar_affinity_not_known_payday"])
+        self.assertGreater(psychology["friction_sensitivity"]["confidence"], 0)
+        intelligence = self.service.psychology_dashboard(self.merchant)
+        self.assertGreaterEqual(len(intelligence["hypotheses"]), 11)
+        habit = next(row for row in intelligence["hypotheses"] if row["hypothesis_type"] == "habit_strength")
+        self.assertTrue(habit["supporting_evidence"]); self.assertIsNotNone(habit["last_observed_at"])
+        scarcity = next(row for row in intelligence["strategies"] if row["code"] == "genuine_scarcity")
+        self.assertTrue(scarcity["requires"]["verified_inventory_limit"])
+
+    def test_psychology_selects_silence_when_marketing_fatigue_is_high(self):
+        for index, stamp in enumerate(("2026-06-07", "2026-06-21", "2026-07-05")):
+            self.service.ingest_order(self.merchant, {"external_id": f"fatigue-order-{index}", "source": "square", "payment_fingerprint": "fatigue-card", "occurred_at": f"{stamp}T18:00:00+00:00", "total_cents": 2000, "items": [{"name": "Sushi", "quantity": 1, "unit_price_cents": 2000}]})
+        with self.service.db.connect() as connection: guest_id = connection.execute("SELECT id FROM guests WHERE payment_fingerprint='fatigue-card'").fetchone()["id"]
+        campaign_id = self.queued_campaign(guest_id, "fatigue-campaign")
+        stamp = datetime.now(timezone.utc).isoformat()
+        with self.service.db.connect() as connection:
+            for index in range(6):
+                connection.execute("""INSERT INTO outbound_messages(id,merchant_id,campaign_id,guest_id,channel,recipient,status,sent_at,created_at,provider,attempts,idempotency_key)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (f"fatigue-message-{index}", self.merchant, campaign_id, guest_id, "sms", "+15550000000", "delivered", stamp, stamp, "telnyx", 1, f"fatigue-{index}"))
+        predictor = CapturingPredictor(); self.service.predictor = predictor
+        self.service.run_behavior_engine(self.merchant)
+        self.assertEqual(predictor.contexts[0]["psychology"]["recommended_strategy"], "silence")
+        self.assertEqual(predictor.contexts[0]["psychology"]["marketing_fatigue"]["level"], "high")
 
     def test_square_payment_enriches_order_with_customer_card_items_and_modifiers(self):
         square = SquareIntegration(self.service.db, self.service, cipher=object())

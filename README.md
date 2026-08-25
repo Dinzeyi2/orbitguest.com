@@ -73,3 +73,5 @@ before a volume is configured. For persistent production data, mount a volume at
 ```bash
 PYTHONPATH=src python -m unittest discover -s tests -v
 ```
+
+The evidence-based psychology layer inside the behavior engine is documented in [docs/PSYCHOLOGY.md](docs/PSYCHOLOGY.md).

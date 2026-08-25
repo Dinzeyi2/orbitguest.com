@@ -144,3 +144,12 @@ semantics, model boundaries, and the rollout procedure.
 The current service preserves files on `ORBIT_STORAGE_DIR`, records extraction
 confidence, and routes confidence below 0.75 to `needs_review`. Add malware scanning
 and object-storage encryption before accepting untrusted production attachments.
+
+## Behavior psychology
+
+`POST /v1/behavior/context` records a source-labelled weather, temperature, sporting-event, holiday, or pay-cycle observation. Psychology results are included in each customer returned by `GET /v1/dashboard/behaviors`.
+
+### Psychology evidence and experiments
+
+- `POST /v1/behavior/interactions` records a checkout, prepared-basket, saved-payment, delivery, or pickup observation for a merchant guest.
+- `GET /v1/dashboard/psychology` returns versioned hypotheses, strategy definitions, experiment assignments, conversions, estimated incremental profit, response time, and unsubscribe results.

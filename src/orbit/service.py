@@ -11,6 +11,7 @@ from collections import Counter
 from .pos import ConfigurablePOSAdapter
 from .inventory import InventoryEngine
 from .evaluation import EvaluationEngine
+from .psychology import PsychologyEngine
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -35,6 +36,7 @@ class OrbitService:
         self.delivery = delivery
         self.inventory = InventoryEngine(db)
         self.evaluations = EvaluationEngine(db)
+        self.psychology = PsychologyEngine()
 
     def _audit(self, c, merchant, action, entity_type, entity_id, metadata=None, actor="api"):
         c.execute("INSERT INTO audit_log(id,merchant_id,action,actor,entity_type,entity_id,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
@@ -244,6 +246,41 @@ class OrbitService:
         with self.db.connect() as c: row = c.execute("SELECT * FROM merchant_operational_state WHERE merchant_id=?", (merchant,)).fetchone()
         if not row: return {"accepting_orders": True, "capacity_remaining": None, "preparation_minutes": None, "promotions": []}
         result = dict(row); result["accepting_orders"] = bool(result["accepting_orders"]); result["promotions"] = json.loads(result.pop("promotions_json") or "[]"); return result
+
+    def record_behavior_context(self, merchant, data):
+        allowed = {"weather", "temperature", "sporting_event", "holiday", "pay_cycle"}
+        if data["signal_type"] not in allowed: raise ValueError("unsupported behavior context signal")
+        confidence = float(data.get("confidence", 1))
+        if not 0 <= confidence <= 1: raise ValueError("confidence must be between 0 and 1")
+        signal_id = uid("bctx")
+        with self.db.connect() as c:
+            c.execute("INSERT INTO behavior_context_signals VALUES(?,?,?,?,?,?,?,?,?,?)",
+                      (signal_id, merchant, data.get("location_id"), data["signal_type"], data["starts_at"], data["ends_at"], json.dumps(data.get("value", {})), data["source"], confidence, now()))
+            self._audit(c, merchant, "behavior.context_recorded", "behavior_context_signal", signal_id,
+                        {"signal_type": data["signal_type"], "source": data["source"]})
+        return {"id": signal_id, "status": "recorded"}
+
+    def record_behavior_interaction(self, merchant, data):
+        with self.db.connect() as c:
+            guest = c.execute("SELECT id FROM guests WHERE id=? AND merchant_id=?", (data["guest_id"], merchant)).fetchone()
+            if not guest: raise KeyError("guest not found")
+            if data.get("campaign_id") and not c.execute("SELECT 1 FROM campaigns WHERE id=? AND merchant_id=? AND guest_id=?", (data["campaign_id"], merchant, guest["id"])).fetchone():
+                raise ValueError("campaign does not belong to this merchant guest")
+            interaction_id = self.psychology.record_interaction(c, merchant, guest["id"], data["event_type"], data.get("metadata", {}), data.get("campaign_id"), data.get("occurred_at"))
+        return {"id": interaction_id, "status": "recorded"}
+
+    def psychology_dashboard(self, merchant):
+        with self.db.connect() as c:
+            hypotheses = [dict(row) for row in c.execute("SELECT * FROM psychological_hypotheses WHERE merchant_id=? ORDER BY guest_id,hypothesis_type", (merchant,))]
+            strategies = [dict(row) for row in c.execute("SELECT * FROM psychology_strategies WHERE active=1 ORDER BY code")]
+            experiments = [dict(row) for row in c.execute("SELECT * FROM psychology_experiments WHERE merchant_id=? ORDER BY assigned_at DESC", (merchant,))]
+            aggregate = [dict(row) for row in c.execute("""SELECT strategy_code,control_group,COUNT(*) assignments,SUM(converted) conversions,
+                SUM(unsubscribed) unsubscribes,COALESCE(SUM(order_value_cents),0) revenue_cents,COALESCE(SUM(incremental_profit_cents),0) estimated_incremental_profit_cents,
+                AVG(seconds_to_order) average_seconds_to_order FROM psychology_experiments WHERE merchant_id=? GROUP BY strategy_code,control_group""", (merchant,))]
+        for row in hypotheses:
+            row["supporting_evidence"] = json.loads(row.pop("supporting_evidence_json")); row["contradicting_evidence"] = json.loads(row.pop("contradicting_evidence_json"))
+        for row in strategies: row["requires"] = json.loads(row.pop("requires_json")); row["active"] = bool(row["active"])
+        return {"hypotheses": hypotheses, "strategies": strategies, "experiments": experiments, "strategy_results": aggregate}
 
     def capture_identity(self, merchant, data):
         fingerprint = data.get("payment_fingerprint")
@@ -471,6 +508,8 @@ class OrbitService:
             operational = {"accepting_orders": bool(operational_row["accepting_orders"]), "capacity_remaining": operational_row["capacity_remaining"], "preparation_minutes": operational_row["preparation_minutes"], "promotions": json.loads(operational_row["promotions_json"] or "[]")} if operational_row else {"accepting_orders": True, "capacity_remaining": None, "preparation_minutes": None, "promotions": []}
             created = 0
             for profile in profiles:
+                psychology = self.psychology.analyze(c, merchant, profile)
+                psychology_facts = {key: value for key, value in (psychology or {}).items() if key not in {"guest_id", "merchant_id"}}
                 favorite = c.execute("SELECT normalized_item,display_name,order_count FROM guest_item_affinities WHERE guest_id=? ORDER BY order_count DESC,total_spend_cents DESC LIMIT 1", (profile["guest_id"],)).fetchone()
                 channel = "sms" if profile["profile_status"] == "identified" and profile["phone"] and self._consented(c, merchant, profile["guest_id"], "sms") else None
                 if not channel and profile["profile_status"] == "identified" and profile["email"] and self._consented(c, merchant, profile["guest_id"], "email"): channel = "email"
@@ -486,7 +525,7 @@ class OrbitService:
                 # Contact details and names never leave Orbit for prediction. The model
                 # receives behavioral facts only; delivery resolves the recipient later.
                 behavior = {key: profile[key] for key in ("visit_count", "lifetime_spend_cents", "average_ticket_cents", "median_ticket_cents", "first_visit_at", "last_visit_at", "average_interval_days", "interval_stddev_days", "days_since_last_visit", "overdue_by_days", "favorite_weekday", "favorite_hour", "predicted_next_visit_at", "behavior_status", "confidence", "weekday_distribution_json", "hour_distribution_json", "return_probabilities_json")}
-                decision_facts = {"profile": behavior, "favorite_items": affinities, "frequent_item_pairs": pairs, "message_history": engagement, "recent_supplier_deliveries": inventory, "menu_economics": menu_economics, "operational_state": operational}
+                decision_facts = {"profile": behavior, "psychology": psychology_facts, "favorite_items": affinities, "frequent_item_pairs": pairs, "message_history": engagement, "recent_supplier_deliveries": inventory, "menu_economics": menu_economics, "operational_state": operational}
                 context_key = hashlib.sha256(json.dumps(decision_facts, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:24]
                 if c.execute("SELECT 1 FROM predictions WHERE merchant_id=? AND guest_id=? AND trigger_ref LIKE ? LIMIT 1", (merchant, profile["guest_id"], f"{context_key}:%")).fetchone():
                     continue
@@ -529,7 +568,7 @@ class OrbitService:
                         inventory_available = bool(economics and economics["estimated_portions"] > 0 and economics["status"] not in ("probably_unavailable", "inventory_uncertain"))
                         eligibility = {"authorized_channel": bool(channel), "not_suppressed": not suppressed, "cooldown_clear": not contacted_recently, "menu_and_recipe_confirmed": bool(economics), "estimated_inventory_available": inventory_available and recent_delivery, "inventory_confidence": economics["inventory_confidence"] if economics else 0, "capacity_available": capacity_available, "positive_expected_incremental_profit": expected_incremental_profit > 0 and margin >= policy["minimum_margin_cents"], "expected_incremental_profit_cents": expected_incremental_profit}
                         model_action = opportunity.get("action") or ("send_sms" if channel == "sms" else "send_email" if channel == "email" else "do_nothing")
-                        do_not_contact = bool(opportunity.get("do_not_contact")) or statistical_score < .6 or not all((eligibility["authorized_channel"], eligibility["not_suppressed"], eligibility["cooldown_clear"], eligibility["menu_and_recipe_confirmed"], eligibility["estimated_inventory_available"], eligibility["capacity_available"], eligibility["positive_expected_incremental_profit"])) or model_action in ("wait", "do_nothing")
+                        do_not_contact = bool(opportunity.get("do_not_contact")) or psychology_facts.get("recommended_strategy") == "silence" or statistical_score < .6 or not all((eligibility["authorized_channel"], eligibility["not_suppressed"], eligibility["cooldown_clear"], eligibility["menu_and_recipe_confirmed"], eligibility["estimated_inventory_available"], eligibility["capacity_available"], eligibility["positive_expected_incremental_profit"])) or model_action in ("wait", "do_nothing")
                         prediction_status = "permission_required" if not channel else "do_not_contact" if do_not_contact else "eligible"
                         probabilities = {f"within_{key}_days": value for key,value in statistical_probabilities.items()}
                         basket = [row["display_name"] for row in affinities[:3]] or [opportunity.get("item", "")]
@@ -549,10 +588,12 @@ class OrbitService:
                             window_end = opportunity.get("time_window_end") or (datetime.fromisoformat(opportunity["send_at"].replace("Z", "+00:00")) + timedelta(days=7)).isoformat()
                             needs_approval = policy["mode"] == "pilot" or (policy["mode"] == "assisted" and (statistical_score < policy["automation_threshold"] or economics["inventory_confidence"] < policy["minimum_inventory_confidence"] or model_action == "incentive"))
                             campaign_status = "control" if control else "approval_required" if needs_approval else "queued"
-                            c.execute("""INSERT INTO campaigns(id,merchant_id,guest_id,channel,trigger_type,trigger_ref,subject,body,status,scheduled_at,sent_at,created_at,action,control_group,prediction_window_end,eligibility_json)
-                                         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (campaign_id, merchant, profile["guest_id"], channel, opportunity["type"], prediction_id, opportunity["subject"], opportunity["message"], "control" if control else "queued", opportunity["send_at"], None, now(), model_action, 1 if control else 0, window_end, json.dumps(eligibility)))
+                            strategy = psychology_facts.get("recommended_strategy", "habit_cue")
+                            c.execute("""INSERT INTO campaigns(id,merchant_id,guest_id,channel,trigger_type,trigger_ref,subject,body,status,scheduled_at,sent_at,created_at,action,control_group,prediction_window_end,eligibility_json,psychology_mechanism,psychology_strategy)
+                                         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (campaign_id, merchant, profile["guest_id"], channel, opportunity["type"], prediction_id, opportunity["subject"], opportunity["message"], "control" if control else "queued", opportunity["send_at"], None, now(), model_action, 1 if control else 0, window_end, json.dumps(eligibility), psychology_facts.get("recommended_mechanism"), strategy))
                             c.execute("UPDATE campaigns SET status=? WHERE id=?", (campaign_status, campaign_id))
                             c.execute("INSERT INTO campaign_outcomes(campaign_id,merchant_id,guest_id,group_name) VALUES(?,?,?,?)", (campaign_id, merchant, profile["guest_id"], "control" if control else "messaged"))
+                            self.psychology.assign_experiment(c, merchant, profile["guest_id"], campaign_id, strategy, control)
                         created += 1
                     except __import__("sqlite3").IntegrityError: pass
             self._audit(c, merchant, "behavior.engine_ran", "merchant", merchant, {"profiles": len(profiles), "predictions_created": created})
@@ -583,6 +624,14 @@ class OrbitService:
                 customer["favorite_items"] = [dict(item) for item in c.execute("SELECT display_name,order_count,total_quantity,total_spend_cents,last_ordered_at,average_interval_days,preferred_weekday,preferred_hour,predicted_next_order_at FROM guest_item_affinities WHERE guest_id=? ORDER BY order_count DESC,total_spend_cents DESC LIMIT 10", (row["guest_id"],))]
                 customer["frequent_combinations"] = [dict(pair) for pair in c.execute("SELECT first_item,second_item,order_count,last_ordered_at FROM guest_item_pairs WHERE guest_id=? ORDER BY order_count DESC LIMIT 10", (row["guest_id"],))]
                 customer["favorite_modifiers"] = [dict(modifier) for modifier in c.execute("SELECT modifier_name,order_count,last_ordered_at FROM guest_modifier_affinities WHERE guest_id=? ORDER BY order_count DESC LIMIT 10", (row["guest_id"],))]
+                psychology = c.execute("SELECT * FROM behavior_psychology_profiles WHERE guest_id=?", (row["guest_id"],)).fetchone()
+                if psychology:
+                    customer["psychology"] = dict(psychology)
+                    customer["psychology"]["context_affinities"] = json.loads(customer["psychology"].pop("context_affinities_json") or "{}")
+                    customer["psychology"]["evidence"] = json.loads(customer["psychology"].pop("evidence_json") or "{}")
+                    customer["psychology"]["marketing_fatigue"] = json.loads(customer["psychology"].pop("marketing_fatigue_json") or "{}")
+                    customer["psychology"]["friction_sensitivity"] = json.loads(customer["psychology"].pop("friction_sensitivity_json") or "{}")
+                    customer["psychology"]["controlled_novelty"] = bool(customer["psychology"]["controlled_novelty"])
                 customers.append(customer)
         return {"summary": {"profile_count": len(customers), "identified_count": sum(customer["profile_status"] == "identified" for customer in customers), "overdue_count": sum(customer["behavior_status"] == "overdue" for customer in customers)}, "customers": customers}
 
@@ -713,6 +762,9 @@ class OrbitService:
                 c.execute("INSERT OR REPLACE INTO suppressions VALUES(?,?,?,?,?)", (merchant, message["guest_id"], message["channel"], "provider_unsubscribe", occurred))
                 c.execute("INSERT INTO consents VALUES(?,?,?,?,?,?,?,?)", (uid("con"), merchant, message["guest_id"], message["channel"], "denied", "provider-unsubscribe", "provider_unsubscribe", occurred))
                 c.execute("UPDATE campaign_outcomes SET unsubscribed=1 WHERE campaign_id=?", (message["campaign_id"],))
+                c.execute("UPDATE psychology_experiments SET unsubscribed=1,evaluated_at=? WHERE campaign_id=?", (occurred, message["campaign_id"]))
+            if event_type in ("opened", "clicked"):
+                self.psychology.record_interaction(c, merchant, message["guest_id"], f"message_{event_type}", data.get("metadata", {}), message["campaign_id"], occurred)
         return {"event_id": event_id, "status": "recorded"}
 
     def record_provider_event(self, provider, event_id, event_type, provider_message_id, occurred_at=None, metadata=None):
@@ -753,13 +805,15 @@ class OrbitService:
 
     def _attribute(self, c, merchant, order_id, guest_id, occurred_at, revenue):
         if not guest_id: return
-        campaign = c.execute("""SELECT id,status,control_group,COALESCE(sent_at,scheduled_at) exposure_at FROM campaigns
+        campaign = c.execute("""SELECT id,status,control_group,eligibility_json,COALESCE(sent_at,scheduled_at) exposure_at FROM campaigns
                               WHERE merchant_id=? AND guest_id=? AND status IN ('sent','control')
                               AND COALESCE(sent_at,scheduled_at)<=? AND (prediction_window_end IS NULL OR prediction_window_end>=?)
                               ORDER BY COALESCE(sent_at,scheduled_at) DESC LIMIT 1""", (merchant, guest_id, occurred_at, occurred_at)).fetchone()
         if campaign:
             seconds = max(0, int((datetime.fromisoformat(occurred_at.replace("Z", "+00:00"))-datetime.fromisoformat(campaign["exposure_at"].replace("Z", "+00:00"))).total_seconds()))
+            expected_profit = int(json.loads(campaign["eligibility_json"] or "{}").get("expected_incremental_profit_cents", 0))
             c.execute("UPDATE campaign_outcomes SET converted=1,order_id=?,revenue_cents=?,seconds_to_order=?,evaluated_at=? WHERE campaign_id=? AND converted=0", (order_id, revenue, seconds, now(), campaign["id"]))
+            c.execute("UPDATE psychology_experiments SET converted=1,incremental_profit_cents=?,order_value_cents=?,seconds_to_order=?,evaluated_at=? WHERE campaign_id=?", (expected_profit, revenue, seconds, now(), campaign["id"]))
             if not campaign["control_group"]: c.execute("INSERT OR IGNORE INTO attributions VALUES(?,?,?,?,?,?)", (uid("att"), merchant, campaign["id"], order_id, revenue, now()))
 
     def ingest_invoice(self, merchant, data):
