@@ -28,12 +28,25 @@ SMS delivery state, POS-link state, and redemption state.
 
 ## Customer flow
 
-The public `GET /join/{slug}` page collects an E.164 phone number plus explicit
-terms and SMS consent. It submits to `POST /v1/public/enroll/{slug}/submit`.
+The public `GET /join/{slug}` page collects an E.164 phone number, required
+acceptance of the OrbitGuest terms, and a **separate, optional** SMS marketing
+checkbox. It submits to `POST /v1/public/enroll/{slug}/submit`. Submitting
+without SMS consent records no enrollment or identity and sends no message.
 Orbit sends exactly one welcome-offer SMS containing the restaurant name, the
-restaurant-configured promo code and terms, and required STOP instructions.
+restaurant-configured promo code and terms, and required HELP/STOP instructions.
 Duplicate enrollment for the same phone and offer does not send another text.
 Enrollment attempts are rate limited.
+
+The form links to working `/terms` and `/privacy` pages and displays marketing,
+variable-frequency, message/data-rate, HELP, STOP, optional-consent, and mobile
+data non-sharing disclosures inline.
+
+## 10DLC sender registration
+
+OrbitGuest cannot solve perceived-sender registration through disclosure copy.
+When a restaurant is perceived as the sender, that restaurant must have the
+brand and campaign registration required by Telnyx/carriers. Do not place
+multiple unrelated restaurants behind one OrbitGuest marketing campaign.
 
 The JSON description used by custom frontends is available from
 `GET /v1/public/enroll/{slug}`. It deliberately does not expose the promo code.

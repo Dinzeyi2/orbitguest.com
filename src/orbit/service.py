@@ -97,14 +97,16 @@ class OrbitService:
                 FROM merchant_offers WHERE merchant_id=? AND active=1 AND starts_at<=? AND (ends_at IS NULL OR ends_at>=?)
                 ORDER BY created_at DESC LIMIT 1""", (page["merchant_id"], stamp, stamp)).fetchone()
             if not offer: raise KeyError("no active offer")
-        return {"slug": page["slug"], "merchant_name": page["merchant_name"], "headline": page["headline"], "terms_version": page["terms_version"], "offer": dict(offer), "required": {"phone": "E.164", "accept_terms": True, "sms_consent": True}}
+        return {"slug": page["slug"], "merchant_name": page["merchant_name"], "headline": page["headline"], "terms_version": page["terms_version"], "offer": dict(offer), "required": {"phone": "E.164", "accept_terms": True, "sms_consent": False}}
 
     def enroll_in_offer(self, slug, data):
         phone = re.sub(r"[\s().-]", "", data.get("phone", ""))
         if not re.fullmatch(r"\+[1-9]\d{7,14}", phone): raise ValueError("phone must use E.164 format")
-        if data.get("accept_terms") is not True or data.get("sms_consent") is not True: raise ValueError("terms acceptance and SMS consent are required")
+        if data.get("accept_terms") is not True: raise ValueError("terms acceptance is required")
         page_data = self.public_enrollment_page(slug)
         if data.get("terms_version") != page_data["terms_version"]: raise ValueError("the current terms version must be accepted")
+        if data.get("sms_consent") is not True:
+            return {"status": "consent_declined", "message_sent": False, "duplicate": False}
         merchant, offer_id, stamp = page_data["merchant_id"] if "merchant_id" in page_data else None, page_data["offer"]["id"], now()
         # The public response deliberately omits merchant_id; resolve it again by slug.
         with self.db.connect() as c:
@@ -137,7 +139,7 @@ class OrbitService:
                 used = c.execute("SELECT COUNT(*) n FROM offer_enrollments WHERE offer_id=? AND status IN ('offer_sent','delivered','redeemed')", (offer_id,)).fetchone()["n"]
                 if used >= offer["max_redemptions"] and not existing: raise ValueError("offer enrollment limit reached")
         label = f"{offer['discount_value']}% off" if offer["discount_type"] == "percent" else f"${offer['discount_value']/100:.2f} off"
-        body = f"{offer['merchant_name']}: Use promo code {offer['promo_code']} for {label}. {offer['offer_terms']} Reply STOP to opt out."
+        body = f"{offer['merchant_name']}: Use promo code {offer['promo_code']} for {label}. {offer['offer_terms']} Reply HELP for help or STOP to opt out."
         try:
             if not self.delivery: raise DeliveryError("Telnyx delivery is not configured", retryable=False)
             provider_id = self.delivery.send("sms", phone, "", body, idempotency_key=f"offer-{enrollment_id}")
