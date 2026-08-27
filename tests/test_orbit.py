@@ -277,6 +277,10 @@ class OrbitFlowTest(unittest.TestCase):
         markup = Handler._enrollment_html(None, slug, page)
         self.assertIn("Text me the promo code", markup); self.assertIn("/v1/public/enroll/", markup)
         self.assertNotIn("WELCOME10", markup)
+        self.assertIn("I accept Orbit’s Terms and agree to receive texts from Smokehouse, including this offer.", markup)
+        self.assertIn('id="submit" type="submit" disabled', markup)
+        with self.assertRaises(ValueError):
+            self.service.enroll_in_offer(slug, {"phone": "+15550999999", "accept_terms": False, "sms_consent": False, "terms_version": page["terms_version"]})
 
     def test_offer_redemption_connects_generic_signup_to_exact_pos_identity(self):
         self.service.delivery = FakeDelivery()

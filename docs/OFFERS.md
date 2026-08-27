@@ -64,3 +64,14 @@ repair is idempotent, preserves all merchant/API/POS/invoice data, and requires
 no manual database command. After deployment, `GET /v1/offers` returns the new
 `page` and `enrollment_url`; the restaurant must then configure an active offer
 with `POST /v1/offers` before the public page accepts customers.
+
+## Custom frontend
+
+A custom dashboard/site can either link directly to the backend-hosted
+`${PUBLIC_BASE_URL}/join/{slug}` page or render its own form from
+`GET /v1/public/enroll/{slug}`. Submit the phone, the returned `terms_version`,
+`accept_terms: true`, and `sms_consent: true` to
+`POST /v1/public/enroll/{slug}/submit`. Keep the submit button disabled until the
+checkbox is selected. The API independently rejects the request unless both
+consent booleans are exactly `true`, so bypassing frontend validation cannot
+send a promo text.
