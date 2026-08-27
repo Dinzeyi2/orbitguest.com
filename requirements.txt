@@ -1,0 +1,2 @@
+# Railway/Nixpacks installs this file before starting Orbit.
+cryptography>=43,<47
