@@ -1,3 +1,5 @@
+import hashlib
+import re
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -433,6 +435,28 @@ class Database:
                 ) from error
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            # Merchants created before public offer pages existed must receive the
+            # same dashboard link as newly created merchants. Keep the first clean
+            # slug and use a deterministic merchant-specific suffix on collisions.
+            used_slugs = {row["slug"] for row in connection.execute("SELECT slug FROM merchant_enrollment_pages")}
+            legacy_merchants = connection.execute("""SELECT id,name,created_at FROM merchants
+                WHERE id NOT IN (SELECT merchant_id FROM merchant_enrollment_pages)
+                ORDER BY created_at,id""").fetchall()
+            for merchant in legacy_merchants:
+                base = re.sub(r"[^a-z0-9]+", "-", merchant["name"].lower()).strip("-")[:40] or "restaurant"
+                slug = base
+                if slug in used_slugs:
+                    suffix = hashlib.sha256(merchant["id"].encode()).hexdigest()
+                    length = 6
+                    slug = f"{base}-{suffix[:length]}"
+                    while slug in used_slugs:
+                        length += 2
+                        slug = f"{base}-{suffix[:length]}"
+                connection.execute("INSERT INTO merchant_enrollment_pages VALUES(?,?,?,?,?,?,?)",
+                                   (merchant["id"], slug, 1, "orbit-offers-v1", f"Join {merchant['name']} offers", merchant["created_at"], merchant["created_at"]))
+                used_slugs.add(slug)
+            if legacy_merchants:
+                connection.execute("INSERT OR IGNORE INTO orbit_migrations(name,applied_at) VALUES('merchant_enrollment_page_backfill_v1',datetime('now'))")
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(merchants)")}
             if "inbound_alias" not in columns:
                 connection.execute("ALTER TABLE merchants ADD COLUMN inbound_alias TEXT")

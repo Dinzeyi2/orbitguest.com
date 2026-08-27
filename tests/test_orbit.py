@@ -148,6 +148,27 @@ class OrbitFlowTest(unittest.TestCase):
             self.assertTrue({"provider", "attempts", "next_attempt_at", "last_event_at", "dead_lettered_at", "idempotency_key"}.issubset(columns))
             self.assertIn("idx_messages_provider", indexes)
 
+    def test_existing_merchants_receive_collision_safe_offer_pages_on_startup(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = str(Path(root) / "legacy-merchants.db")
+            database = Database(path)
+            with database.connect() as connection:
+                connection.execute("INSERT INTO merchants VALUES(?,?,?,?,?)", ("legacy-one", "Legacy Cafe", "key-one", "legacy-one@invoices.test", "2026-01-01T00:00:00+00:00"))
+                connection.execute("INSERT INTO merchants VALUES(?,?,?,?,?)", ("legacy-two", "Legacy Cafe", "key-two", "legacy-two@invoices.test", "2026-01-02T00:00:00+00:00"))
+            Database(path)
+            Database(path)  # The repair must remain idempotent across redeploys.
+            with database.connect() as connection:
+                pages = connection.execute("SELECT merchant_id,slug,terms_version FROM merchant_enrollment_pages ORDER BY merchant_id").fetchall()
+                migration = connection.execute("SELECT 1 FROM orbit_migrations WHERE name='merchant_enrollment_page_backfill_v1'").fetchone()
+            self.assertEqual(len(pages), 2)
+            self.assertEqual(pages[0]["slug"], "legacy-cafe")
+            self.assertTrue(pages[1]["slug"].startswith("legacy-cafe-"))
+            self.assertNotEqual(pages[0]["slug"], pages[1]["slug"])
+            self.assertTrue(all(page["terms_version"] == "orbit-offers-v1" for page in pages))
+            self.assertIsNotNone(migration)
+            dashboard = OrbitService(Database(path), storage_dir=self.documents.name).offer_dashboard("legacy-one")
+            self.assertEqual(dashboard["page"]["slug"], "legacy-cafe")
+
     def test_resend_svix_signature_verification(self):
         secret_bytes = b"test-webhook-secret"
         secret = "whsec_" + base64.b64encode(secret_bytes).decode()

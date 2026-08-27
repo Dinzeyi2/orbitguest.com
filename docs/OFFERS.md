@@ -54,3 +54,13 @@ of two ways:
 Codes are single-use per enrolled phone. Redemption is idempotently protected
 by unique enrollment and order constraints, and expired, inactive, exhausted,
 or previously redeemed offers are rejected.
+
+## Existing restaurants
+
+On startup, Orbit automatically backfills an enrollment page for every merchant
+created before this feature existed. The first restaurant receives the clean
+slug; duplicate names receive a deterministic merchant-specific suffix. The
+repair is idempotent, preserves all merchant/API/POS/invoice data, and requires
+no manual database command. After deployment, `GET /v1/offers` returns the new
+`page` and `enrollment_url`; the restaurant must then configure an active offer
+with `POST /v1/offers` before the public page accepts customers.
