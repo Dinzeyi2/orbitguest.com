@@ -230,6 +230,48 @@ class OrbitFlowTest(unittest.TestCase):
         self.assertEqual(consent["status"], "granted")
         with self.assertRaises(ValueError): self.service.accept_identity_claim(claim["claim_token"], {"phone": "+15550000000", "terms": {"accepted": True, "version": "v2"}})
 
+    def test_restaurant_offer_link_sends_real_first_offer_and_claim_links_exact_pos_guest(self):
+        self.order("offer-claim-order")
+        claim = self.service.create_identity_claim(self.merchant, {"external_order_id": "offer-claim-order"})
+        self.service.delivery = FakeDelivery()
+        offer = self.service.configure_offer(self.merchant, {"name": "Welcome offer", "discount_type": "percent", "discount_value": 10, "promo_code": "WELCOME10", "offer_terms": "Valid on one purchase."})
+        slug = offer["enrollment_url"].rsplit("/", 1)[-1]
+        page = self.service.public_enrollment_page(slug)
+        self.assertEqual(page["offer"]["discount_value"], 10)
+        self.assertNotIn("promo_code", page["offer"])
+        result = self.service.enroll_in_offer(slug, {"phone": "+15550101010", "accept_terms": True, "sms_consent": True, "terms_version": page["terms_version"], "claim_token": claim["claim_token"]})
+        self.assertTrue(result["linked_to_pos"]); self.assertEqual(result["status"], "offer_sent")
+        self.assertEqual(len(self.service.delivery.sent), 1)
+        body = self.service.delivery.sent[0][3]
+        self.assertIn("WELCOME10", body); self.assertIn("10% off", body); self.assertIn("STOP", body)
+        delivered = self.service.record_provider_event("telnyx", "offer-delivered-event", "message.delivered", "provider-message-1", datetime.now(timezone.utc).isoformat(), {})
+        self.assertEqual(delivered["status"], "delivered")
+        duplicate = self.service.enroll_in_offer(slug, {"phone": "+15550101010", "accept_terms": True, "sms_consent": True, "terms_version": page["terms_version"]})
+        self.assertTrue(duplicate["duplicate"]); self.assertEqual(len(self.service.delivery.sent), 1)
+        with self.service.db.connect() as connection:
+            order_guest = connection.execute("SELECT guest_id FROM orders WHERE external_id='offer-claim-order'").fetchone()["guest_id"]
+            enrolled = connection.execute("SELECT contact_guest_id,linked_guest_id FROM offer_enrollments WHERE id=?", (result["enrollment_id"],)).fetchone()
+        self.assertEqual(enrolled["contact_guest_id"], order_guest); self.assertEqual(enrolled["linked_guest_id"], order_guest)
+        from orbit.api import Handler
+        markup = Handler._enrollment_html(None, slug, page)
+        self.assertIn("Text me the promo code", markup); self.assertIn("/v1/public/enroll/", markup)
+        self.assertNotIn("WELCOME10", markup)
+
+    def test_offer_redemption_connects_generic_signup_to_exact_pos_identity(self):
+        self.service.delivery = FakeDelivery()
+        offer = self.service.configure_offer(self.merchant, {"discount_value": 10, "promo_code": "COFFEE10", "offer_terms": "One use."})
+        slug = offer["enrollment_url"].rsplit("/", 1)[-1]; page = self.service.public_enrollment_page(slug)
+        enrolled = self.service.enroll_in_offer(slug, {"phone": "+15550202020", "accept_terms": True, "sms_consent": True, "terms_version": page["terms_version"]})
+        self.assertFalse(enrolled["linked_to_pos"])
+        self.service.ingest_order(self.merchant, {"external_id": "coffee-redemption", "source": "square", "payment_fingerprint": "coffee-card", "occurred_at": datetime.now(timezone.utc).isoformat(), "total_cents": 900, "discount_cents": 100, "items": [{"name": "Latte", "quantity": 1, "unit_price_cents": 1000}]})
+        redemption = self.service.redeem_offer(self.merchant, {"phone": "+15550202020", "promo_code": "COFFEE10", "external_order_id": "coffee-redemption", "discount_cents": 100})
+        self.assertTrue(redemption["linked_to_pos"])
+        with self.service.db.connect() as connection:
+            target = connection.execute("SELECT phone,profile_status FROM guests WHERE id=?", (redemption["guest_id"],)).fetchone()
+            consent = connection.execute("SELECT status FROM consents WHERE guest_id=? AND channel='sms' ORDER BY captured_at DESC", (redemption["guest_id"],)).fetchone()
+        self.assertEqual(target["phone"], "+15550202020"); self.assertEqual(target["profile_status"], "identified"); self.assertEqual(consent["status"], "granted")
+        with self.assertRaises(ValueError): self.service.redeem_offer(self.merchant, {"phone": "+15550202020", "promo_code": "COFFEE10", "external_order_id": "coffee-redemption"})
+
     def test_behavior_engine_learns_cadence_time_items_and_combinations_without_sharing_pii(self):
         for external, occurred in (("habit-1", "2026-06-07T18:30:00+00:00"), ("habit-2", "2026-06-21T18:35:00+00:00"), ("habit-3", "2026-07-05T18:25:00+00:00")):
             self.service.ingest_order(self.merchant, {"external_id": external, "source": "square", "payment_fingerprint": "habit-token", "occurred_at": occurred, "total_cents": 3800, "items": [{"name": "Smoked Ribs", "quantity": 1, "unit_price_cents": 3200}, {"name": "Garlic Fries", "quantity": 1, "unit_price_cents": 600}]})

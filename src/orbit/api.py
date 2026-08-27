@@ -1,4 +1,5 @@
 import argparse
+import html
 import json
 import os
 from pathlib import Path
@@ -21,6 +22,18 @@ class Handler(BaseHTTPRequestHandler):
     def _send(self, status, body):
         payload = json.dumps(body).encode()
         self.send_response(status); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(payload))); self.end_headers(); self.wfile.write(payload)
+    def _send_html(self, status, body):
+        payload = body.encode()
+        self.send_response(status); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"); self.send_header("X-Content-Type-Options", "nosniff"); self.send_header("Content-Length", str(len(payload))); self.end_headers(); self.wfile.write(payload)
+    def _enrollment_html(self, slug, page):
+        merchant = html.escape(page["merchant_name"]); headline = html.escape(page["headline"])
+        offer = page["offer"]; label = f"{offer['discount_value']}% off" if offer["discount_type"] == "percent" else f"${offer['discount_value']/100:.2f} off"
+        terms = html.escape(offer["offer_terms"]); terms_version = html.escape(page["terms_version"])
+        endpoint = f"/v1/public/enroll/{slug}/submit"
+        return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{merchant} offer</title><style>
+        :root{{font-family:Inter,ui-sans-serif,system-ui,sans-serif;color:#17211b;background:#f4f7f3}}*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px}}main{{width:min(100%,480px);background:#fff;border:1px solid #dce5dc;border-radius:24px;padding:32px;box-shadow:0 18px 55px #18351c18}}.brand{{font-weight:800;color:#247a3c;letter-spacing:.08em;text-transform:uppercase;font-size:.78rem}}h1{{font-size:2rem;line-height:1.08;margin:12px 0}}.offer{{font-size:1.35rem;font-weight:750;color:#247a3c;margin:18px 0}}label{{display:block;font-weight:650;margin:18px 0 8px}}input[type=tel]{{width:100%;font:inherit;padding:14px;border:1px solid #b8c6ba;border-radius:12px}}.consent{{display:flex;gap:10px;font-size:.9rem;line-height:1.4;font-weight:400}}button{{width:100%;border:0;border-radius:12px;background:#247a3c;color:white;font:inherit;font-weight:750;padding:15px;margin-top:20px;cursor:pointer}}button:disabled{{opacity:.6}}small{{display:block;color:#647067;line-height:1.45;margin-top:12px}}#result{{margin-top:16px;padding:12px;border-radius:10px;display:none}}.ok{{display:block!important;background:#edf8ef;color:#175c2c}}.error{{display:block!important;background:#fff0ef;color:#9b2c25}}</style></head><body><main>
+        <div class="brand">{merchant}</div><h1>{headline}</h1><div class="offer">Get {html.escape(label)} your next purchase</div><form id="join"><label for="phone">Mobile phone number</label><input id="phone" type="tel" inputmode="tel" autocomplete="tel" placeholder="+1 555 123 4567" required><label class="consent"><input id="consent" type="checkbox" required><span>I accept Orbit's terms and agree to receive this offer and future marketing texts from {merchant}. Message and data rates may apply. Reply STOP to opt out.</span></label><small>{terms}</small><button id="submit" type="submit">Text me the promo code</button></form><div id="result" role="status"></div>
+        <script>const form=document.getElementById('join'),result=document.getElementById('result'),button=document.getElementById('submit');form.addEventListener('submit',async(e)=>{{e.preventDefault();button.disabled=true;result.className='';result.textContent='';const claim=new URLSearchParams(location.search).get('claim_token');try{{const response=await fetch({json.dumps(endpoint)},{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{phone:document.getElementById('phone').value,accept_terms:true,sms_consent:document.getElementById('consent').checked,terms_version:{json.dumps(terms_version)},claim_token:claim||undefined}})}});const data=await response.json();if(!response.ok)throw new Error(data.error||'Unable to send offer');result.className='ok';result.textContent=data.duplicate?'Your offer was already requested. Check your messages.':'Your promo code is on its way.';form.hidden=true}}catch(error){{result.className='error';result.textContent=error.message;button.disabled=false}}}});</script></main></body></html>"""
     def _raw_body(self):
         size = int(self.headers.get("Content-Length", "0"))
         if size > 32 * 1024 * 1024: raise ValueError("request body exceeds 32 MB")
@@ -68,6 +81,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(202, self.service.receive_email(data))
             if path == "/v1/identity/claim":
                 return self._send(200, self.service.accept_identity_claim(data.get("claim_token"), data))
+            if path.startswith("/v1/public/enroll/"):
+                parts = path.strip("/").split("/")
+                if len(parts) == 5 and parts[4] == "submit":
+                    data["_request_ip"] = self.client_address[0]
+                    return self._send(200, self.service.enroll_in_offer(parts[3], data))
             if path == "/v1/merchants": return self._send(201, self.service.create_merchant(data["name"]))
             merchant = self._merchant()
             if not merchant: return self._send(401, {"error": "unauthorized"})
@@ -91,6 +109,8 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/v1/evaluations/messages": result = self.service.run_message_evaluation(merchant)
             elif path.startswith("/v1/campaigns/") and path.endswith("/approve"): result = self.service.approve_campaign(merchant, path.split("/")[3], data.get("approved_by", "restaurant_manager"))
             elif path == "/v1/operations/state": result = self.service.update_operational_state(merchant, data)
+            elif path == "/v1/offers": result = self.service.configure_offer(merchant, data)
+            elif path == "/v1/offers/redeem": result = self.service.redeem_offer(merchant, data)
             elif path == "/v1/behavior/context": result = self.service.record_behavior_context(merchant, data)
             elif path == "/v1/behavior/interactions": result = self.service.record_behavior_interaction(merchant, data)
             elif path == "/v1/webhooks/invoices": result = self.service.ingest_invoice(merchant, data)
@@ -109,6 +129,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path); path, merchant = parsed.path, self._merchant()
         if path == "/health": return self._send(200, {"status": "ok"})
+        if path.startswith("/join/"):
+            slug = path.strip("/").split("/")[1]
+            try: return self._send_html(200, self._enrollment_html(slug, self.service.public_enrollment_page(slug)))
+            except KeyError: return self._send_html(404, "<!doctype html><title>Offer unavailable</title><p>This offer is not currently available.</p>")
+        if path.startswith("/v1/public/enroll/"):
+            try: return self._send(200, self.service.public_enrollment_page(path.strip("/").split("/")[3]))
+            except KeyError as error: return self._send(404, {"error": str(error)})
         if path == "/v1/integrations/square/callback":
             query = parse_qs(parsed.query)
             try: return self._send(200, self.square.callback(query["code"][0], query["state"][0]))
@@ -118,6 +145,7 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/v1/guests/"): result = self.service.guest_profile(merchant, path.split("/")[3])
             elif path == "/v1/campaigns": result = self.service.list_campaigns(merchant)
             elif path == "/v1/metrics": result = self.service.metrics(merchant)
+            elif path == "/v1/offers": result = self.service.offer_dashboard(merchant)
             elif path == "/v1/dashboard/invoices": result = self.service.invoice_dashboard(merchant)
             elif path == "/v1/dashboard/products": result = self.service.product_dashboard(merchant)
             elif path.startswith("/v1/products/") and path.endswith("/history"): result = self.service.product_history(merchant, path.split("/")[3])

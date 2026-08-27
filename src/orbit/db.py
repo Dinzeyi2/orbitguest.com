@@ -27,6 +27,39 @@ CREATE TABLE IF NOT EXISTS identity_claims (
  FOREIGN KEY(merchant_id) REFERENCES merchants(id), FOREIGN KEY(guest_id) REFERENCES guests(id),
  FOREIGN KEY(order_id) REFERENCES orders(id)
 );
+CREATE TABLE IF NOT EXISTS merchant_enrollment_pages (
+ merchant_id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1,
+ terms_version TEXT NOT NULL, headline TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ FOREIGN KEY(merchant_id) REFERENCES merchants(id)
+);
+CREATE TABLE IF NOT EXISTS merchant_offers (
+ id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, name TEXT NOT NULL,
+ discount_type TEXT NOT NULL, discount_value INTEGER NOT NULL, promo_code TEXT NOT NULL,
+ offer_terms TEXT NOT NULL, starts_at TEXT NOT NULL, ends_at TEXT,
+ max_redemptions INTEGER, active INTEGER NOT NULL DEFAULT 1,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ UNIQUE(merchant_id,promo_code), FOREIGN KEY(merchant_id) REFERENCES merchants(id)
+);
+CREATE TABLE IF NOT EXISTS offer_enrollments (
+ id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, offer_id TEXT NOT NULL,
+ contact_guest_id TEXT NOT NULL, linked_guest_id TEXT, phone TEXT NOT NULL,
+ consent_version TEXT NOT NULL, terms_version TEXT NOT NULL, consented_at TEXT NOT NULL,
+ status TEXT NOT NULL, provider_message_id TEXT, send_error TEXT,
+ claim_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ UNIQUE(offer_id,phone), FOREIGN KEY(offer_id) REFERENCES merchant_offers(id),
+ FOREIGN KEY(contact_guest_id) REFERENCES guests(id), FOREIGN KEY(linked_guest_id) REFERENCES guests(id)
+);
+CREATE TABLE IF NOT EXISTS offer_redemptions (
+ id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, enrollment_id TEXT NOT NULL UNIQUE,
+ offer_id TEXT NOT NULL, order_id TEXT NOT NULL UNIQUE, redeemed_at TEXT NOT NULL,
+ discount_cents INTEGER, created_at TEXT NOT NULL,
+ FOREIGN KEY(enrollment_id) REFERENCES offer_enrollments(id),
+ FOREIGN KEY(offer_id) REFERENCES merchant_offers(id), FOREIGN KEY(order_id) REFERENCES orders(id)
+);
+CREATE TABLE IF NOT EXISTS offer_enrollment_attempts (
+ id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, phone_hash TEXT NOT NULL,
+ ip_hash TEXT NOT NULL, attempted_at TEXT NOT NULL, outcome TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS orders (
  id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, external_id TEXT NOT NULL, guest_id TEXT,
  payment_fingerprint TEXT, occurred_at TEXT NOT NULL, total_cents INTEGER NOT NULL,
@@ -362,6 +395,9 @@ CREATE INDEX IF NOT EXISTS idx_guest_identities ON guest_identities(merchant_id,
 CREATE INDEX IF NOT EXISTS idx_items_name ON order_items(normalized_name);
 CREATE INDEX IF NOT EXISTS idx_consent_guest ON consents(merchant_id, guest_id, channel, captured_at);
 CREATE INDEX IF NOT EXISTS idx_identity_claim_order ON identity_claims(merchant_id,order_id,expires_at);
+CREATE INDEX IF NOT EXISTS idx_offer_active ON merchant_offers(merchant_id,active,starts_at,ends_at);
+CREATE INDEX IF NOT EXISTS idx_offer_enrollment_phone ON offer_enrollments(merchant_id,phone,status);
+CREATE INDEX IF NOT EXISTS idx_offer_attempts ON offer_enrollment_attempts(phone_hash,ip_hash,attempted_at);
 CREATE INDEX IF NOT EXISTS idx_invoice_lines_invoice ON invoice_lines(invoice_id);
 CREATE INDEX IF NOT EXISTS idx_documents_email ON invoice_documents(inbound_email_id);
 CREATE INDEX IF NOT EXISTS idx_products_merchant ON catalog_products(merchant_id, vendor, normalized_name);

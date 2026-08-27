@@ -75,3 +75,5 @@ PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
 The evidence-based psychology layer inside the behavior engine is documented in [docs/PSYCHOLOGY.md](docs/PSYCHOLOGY.md).
+
+Restaurant-specific public signup links, welcome-offer SMS, and exact POS redemption linking are documented in [docs/OFFERS.md](docs/OFFERS.md).

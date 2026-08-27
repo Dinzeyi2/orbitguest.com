@@ -88,3 +88,7 @@ simulates the inbound provider; connecting Resend or another provider is the nex
 
 For staging behavior demonstrations only, follow `docs/DEMO.md`. Never configure
 `ORBIT_DEMO_MODE=true` on the Production Railway service.
+
+## Public offer signup links
+
+Set `PUBLIC_BASE_URL=https://api.orbitguest.com` so new merchants receive working backend-hosted `/join/{slug}` links. Optionally set `ORBIT_ENROLLMENT_BASE_URL=https://orbitguest.com/join` after the dashboard website implements the same enrollment form. Live offer texts require the existing Telnyx variables documented in `docs/MESSAGING.md`.

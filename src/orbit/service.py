@@ -42,14 +42,146 @@ class OrbitService:
         c.execute("INSERT INTO audit_log(id,merchant_id,action,actor,entity_type,entity_id,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
                   (uid("audit"), merchant, action, actor, entity_type, entity_id, json.dumps(metadata or {}, sort_keys=True), now()))
 
+    @staticmethod
+    def _enrollment_url(slug):
+        configured = __import__("os").getenv("ORBIT_ENROLLMENT_BASE_URL")
+        if configured: return f"{configured.rstrip('/')}/{slug}"
+        public = __import__("os").getenv("PUBLIC_BASE_URL", "https://api.orbitguest.com").rstrip("/")
+        return f"{public}/join/{slug}"
+
     def create_merchant(self, name):
         merchant_id, key = uid("mer"), secrets.token_urlsafe(32)
-        slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:40] or "restaurant"
-        alias = f"{slug}-{secrets.token_hex(3)}@invoices.orbitguest.com"
+        base_slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:40] or "restaurant"
+        alias = f"{base_slug}-{secrets.token_hex(3)}@invoices.orbitguest.com"
         with self.db.connect() as c:
+            slug = base_slug
+            if c.execute("SELECT 1 FROM merchant_enrollment_pages WHERE slug=?", (slug,)).fetchone(): slug = f"{base_slug}-{secrets.token_hex(3)}"
+            stamp = now()
             c.execute("INSERT INTO merchants(id,name,api_key_hash,inbound_alias,created_at) VALUES(?,?,?,?,?)", (merchant_id, name, hashlib.sha256(key.encode()).hexdigest(), alias, now()))
+            c.execute("INSERT INTO merchant_enrollment_pages VALUES(?,?,?,?,?,?,?)", (merchant_id, slug, 1, "orbit-offers-v1", f"Join {name} offers", stamp, stamp))
             self._audit(c, merchant_id, "merchant.created", "merchant", merchant_id)
-        return {"id": merchant_id, "name": name, "api_key": key, "invoice_email": alias}
+        return {"id": merchant_id, "name": name, "api_key": key, "invoice_email": alias, "enrollment_slug": slug, "enrollment_url": self._enrollment_url(slug)}
+
+    def configure_offer(self, merchant, data):
+        discount_type = data.get("discount_type", "percent")
+        value = int(data["discount_value"])
+        if discount_type not in ("percent", "fixed_cents"): raise ValueError("discount_type must be percent or fixed_cents")
+        if value <= 0 or (discount_type == "percent" and value > 100): raise ValueError("invalid discount value")
+        code = re.sub(r"[^A-Z0-9_-]", "", data["promo_code"].strip().upper())
+        if not 3 <= len(code) <= 32: raise ValueError("promo_code must contain 3-32 letters, numbers, underscores, or dashes")
+        starts, ends = data.get("starts_at", now()), data.get("ends_at")
+        if ends and ends <= starts: raise ValueError("offer end must be after its start")
+        offer_id, stamp = uid("off"), now()
+        with self.db.connect() as c:
+            page = c.execute("SELECT slug FROM merchant_enrollment_pages WHERE merchant_id=?", (merchant,)).fetchone()
+            if not page: raise KeyError("merchant enrollment page not found")
+            if data.get("replace_active", True): c.execute("UPDATE merchant_offers SET active=0,updated_at=? WHERE merchant_id=? AND active=1", (stamp, merchant))
+            existing = c.execute("SELECT id FROM merchant_offers WHERE merchant_id=? AND promo_code=?", (merchant, code)).fetchone()
+            offer_id = existing["id"] if existing else offer_id
+            if existing:
+                c.execute("""UPDATE merchant_offers SET name=?,discount_type=?,discount_value=?,offer_terms=?,starts_at=?,ends_at=?,max_redemptions=?,active=1,updated_at=? WHERE id=?""",
+                          (data.get("name", f"{value}% off" if discount_type == "percent" else "Restaurant offer"), discount_type, value, data.get("offer_terms", "Valid once per customer. Restaurant terms apply."), starts, ends, data.get("max_redemptions"), stamp, offer_id))
+            else:
+                c.execute("""INSERT INTO merchant_offers(id,merchant_id,name,discount_type,discount_value,promo_code,offer_terms,starts_at,ends_at,max_redemptions,active,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (offer_id, merchant, data.get("name", f"{value}% off" if discount_type == "percent" else "Restaurant offer"), discount_type, value, code, data.get("offer_terms", "Valid once per customer. Restaurant terms apply."), starts, ends, data.get("max_redemptions"), 1, stamp, stamp))
+            self._audit(c, merchant, "offer.configured", "merchant_offer", offer_id, {"promo_code": code, "discount_type": discount_type, "discount_value": value})
+        return {"id": offer_id, "promo_code": code, "enrollment_url": self._enrollment_url(page["slug"]), "status": "active"}
+
+    def public_enrollment_page(self, slug):
+        stamp = now()
+        with self.db.connect() as c:
+            page = c.execute("""SELECT p.slug,p.terms_version,p.headline,m.id merchant_id,m.name merchant_name
+                FROM merchant_enrollment_pages p JOIN merchants m ON m.id=p.merchant_id WHERE p.slug=? AND p.active=1""", (slug,)).fetchone()
+            if not page: raise KeyError("enrollment page not found")
+            offer = c.execute("""SELECT id,name,discount_type,discount_value,offer_terms,starts_at,ends_at
+                FROM merchant_offers WHERE merchant_id=? AND active=1 AND starts_at<=? AND (ends_at IS NULL OR ends_at>=?)
+                ORDER BY created_at DESC LIMIT 1""", (page["merchant_id"], stamp, stamp)).fetchone()
+            if not offer: raise KeyError("no active offer")
+        return {"slug": page["slug"], "merchant_name": page["merchant_name"], "headline": page["headline"], "terms_version": page["terms_version"], "offer": dict(offer), "required": {"phone": "E.164", "accept_terms": True, "sms_consent": True}}
+
+    def enroll_in_offer(self, slug, data):
+        phone = re.sub(r"[\s().-]", "", data.get("phone", ""))
+        if not re.fullmatch(r"\+[1-9]\d{7,14}", phone): raise ValueError("phone must use E.164 format")
+        if data.get("accept_terms") is not True or data.get("sms_consent") is not True: raise ValueError("terms acceptance and SMS consent are required")
+        page_data = self.public_enrollment_page(slug)
+        if data.get("terms_version") != page_data["terms_version"]: raise ValueError("the current terms version must be accepted")
+        merchant, offer_id, stamp = page_data["merchant_id"] if "merchant_id" in page_data else None, page_data["offer"]["id"], now()
+        # The public response deliberately omits merchant_id; resolve it again by slug.
+        with self.db.connect() as c:
+            page = c.execute("SELECT merchant_id FROM merchant_enrollment_pages WHERE slug=? AND active=1", (slug,)).fetchone(); merchant = page["merchant_id"]
+            phone_hash = hashlib.sha256(phone.encode()).hexdigest(); ip_hash = hashlib.sha256(data.get("_request_ip", "unknown").encode()).hexdigest()
+            cutoff = (datetime.now(timezone.utc)-timedelta(hours=1)).isoformat()
+            attempts = c.execute("SELECT COUNT(*) n FROM offer_enrollment_attempts WHERE attempted_at>=? AND (phone_hash=? OR ip_hash=?)", (cutoff, phone_hash, ip_hash)).fetchone()["n"]
+            if attempts >= 5: raise ValueError("too many enrollment attempts; try again later")
+            c.execute("INSERT INTO offer_enrollment_attempts VALUES(?,?,?,?,?,?)", (uid("eat"), merchant, phone_hash, ip_hash, stamp, "accepted"))
+            existing = c.execute("SELECT id,status,provider_message_id FROM offer_enrollments WHERE offer_id=? AND phone=?", (offer_id, phone)).fetchone()
+            if existing and existing["status"] not in ("send_failed",): return {"enrollment_id": existing["id"], "status": existing["status"], "duplicate": True}
+            guest = c.execute("SELECT id FROM guests WHERE merchant_id=? AND phone=? ORDER BY updated_at DESC LIMIT 1", (merchant, phone)).fetchone()
+            claim = None
+            if data.get("claim_token"):
+                claim = c.execute("SELECT * FROM identity_claims WHERE token_hash=? AND used_at IS NULL AND merchant_id=?", (hashlib.sha256(data["claim_token"].encode()).hexdigest(), merchant)).fetchone()
+                if not claim or claim["expires_at"] < stamp: raise ValueError("identity claim is invalid, expired, or already used")
+                guest = c.execute("SELECT id FROM guests WHERE id=?", (claim["guest_id"],)).fetchone()
+            guest_id = guest["id"] if guest else uid("gst")
+            if not guest:
+                c.execute("""INSERT INTO guests(id,merchant_id,payment_fingerprint,name,email,phone,profile_status,terms_version,terms_accepted_at,permission_source,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?, 'identified',?,?,?,?,?)""", (guest_id, merchant, None, data.get("name"), None, phone, page_data["terms_version"], stamp, "public_offer_page", stamp, stamp))
+            self._activate_identity(c, merchant, guest_id, {"name": data.get("name"), "phone": phone, "terms": {"accepted": True, "version": page_data["terms_version"], "source": "public_offer_page"}, "consent": {"sms": {"status": "granted", "disclosure_version": page_data["terms_version"], "source": "public_offer_page"}}}, stamp)
+            if claim: c.execute("UPDATE identity_claims SET used_at=? WHERE id=?", (stamp, claim["id"]))
+            enrollment_id = existing["id"] if existing else uid("enr")
+            if existing: c.execute("UPDATE offer_enrollments SET contact_guest_id=?,linked_guest_id=?,consent_version=?,terms_version=?,consented_at=?,status='sending',send_error=NULL,claim_id=?,updated_at=? WHERE id=?", (guest_id, claim["guest_id"] if claim else None, page_data["terms_version"], page_data["terms_version"], stamp, claim["id"] if claim else None, stamp, enrollment_id))
+            else: c.execute("""INSERT INTO offer_enrollments(id,merchant_id,offer_id,contact_guest_id,linked_guest_id,phone,consent_version,terms_version,consented_at,status,provider_message_id,send_error,claim_id,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,'sending',NULL,NULL,?,?,?)""", (enrollment_id, merchant, offer_id, guest_id, claim["guest_id"] if claim else None, phone, page_data["terms_version"], page_data["terms_version"], stamp, claim["id"] if claim else None, stamp, stamp))
+            offer = c.execute("SELECT o.*,m.name merchant_name FROM merchant_offers o JOIN merchants m ON m.id=o.merchant_id WHERE o.id=?", (offer_id,)).fetchone()
+            if offer["max_redemptions"] is not None:
+                used = c.execute("SELECT COUNT(*) n FROM offer_enrollments WHERE offer_id=? AND status IN ('offer_sent','delivered','redeemed')", (offer_id,)).fetchone()["n"]
+                if used >= offer["max_redemptions"] and not existing: raise ValueError("offer enrollment limit reached")
+        label = f"{offer['discount_value']}% off" if offer["discount_type"] == "percent" else f"${offer['discount_value']/100:.2f} off"
+        body = f"{offer['merchant_name']}: Use promo code {offer['promo_code']} for {label}. {offer['offer_terms']} Reply STOP to opt out."
+        try:
+            if not self.delivery: raise DeliveryError("Telnyx delivery is not configured", retryable=False)
+            provider_id = self.delivery.send("sms", phone, "", body, idempotency_key=f"offer-{enrollment_id}")
+            with self.db.connect() as c:
+                c.execute("UPDATE offer_enrollments SET status='offer_sent',provider_message_id=?,updated_at=? WHERE id=?", (provider_id, now(), enrollment_id))
+                self._audit(c, merchant, "offer.sent", "offer_enrollment", enrollment_id, {"offer_id": offer_id, "linked_to_pos": bool(claim)})
+            return {"enrollment_id": enrollment_id, "status": "offer_sent", "linked_to_pos": bool(claim), "duplicate": False}
+        except Exception as error:
+            with self.db.connect() as c: c.execute("UPDATE offer_enrollments SET status='send_failed',send_error=?,updated_at=? WHERE id=?", (str(error), now(), enrollment_id))
+            raise
+
+    def redeem_offer(self, merchant, data):
+        phone = re.sub(r"[\s().-]", "", data.get("phone", "")); code = data["promo_code"].strip().upper()
+        source = data.get("source", "square")
+        with self.db.connect() as c:
+            offer = c.execute("SELECT * FROM merchant_offers WHERE merchant_id=? AND promo_code=? AND active=1", (merchant, code)).fetchone()
+            if not offer: raise KeyError("active offer not found")
+            stamp = now()
+            if offer["starts_at"] > stamp or (offer["ends_at"] and offer["ends_at"] < stamp): raise ValueError("offer is not currently redeemable")
+            if offer["max_redemptions"] is not None and c.execute("SELECT COUNT(*) n FROM offer_redemptions WHERE offer_id=?", (offer["id"],)).fetchone()["n"] >= offer["max_redemptions"]: raise ValueError("offer redemption limit reached")
+            enrollment = c.execute("SELECT * FROM offer_enrollments WHERE offer_id=? AND phone=?", (offer["id"], phone)).fetchone()
+            if not enrollment: raise KeyError("eligible enrollment not found")
+            if enrollment["status"] == "redeemed" or c.execute("SELECT 1 FROM offer_redemptions WHERE enrollment_id=?", (enrollment["id"],)).fetchone(): raise ValueError("offer already redeemed")
+            if enrollment["status"] not in ("offer_sent", "delivered"): raise ValueError("offer is not eligible for redemption")
+            order = c.execute("SELECT id,guest_id,discount_cents FROM orders WHERE merchant_id=? AND source=? AND external_id=?", (merchant, source, data["external_order_id"])).fetchone()
+            if not order or not order["guest_id"]: raise KeyError("POS order does not have a linkable customer profile")
+            target_id = order["guest_id"]
+            if target_id != enrollment["contact_guest_id"]:
+                contact = c.execute("SELECT name,phone,terms_version,terms_accepted_at FROM guests WHERE id=?", (enrollment["contact_guest_id"],)).fetchone()
+                c.execute("UPDATE guests SET name=COALESCE(name,?),phone=?,profile_status='identified',terms_version=?,terms_accepted_at=?,permission_source='offer_redemption',updated_at=? WHERE id=?", (contact["name"], contact["phone"], contact["terms_version"], contact["terms_accepted_at"], now(), target_id))
+                if not self._consented(c, merchant, target_id, "sms"): c.execute("INSERT INTO consents VALUES(?,?,?,?,?,?,?,?)", (uid("con"), merchant, target_id, "sms", "granted", enrollment["consent_version"], "offer_redemption", now()))
+            redemption_id = uid("red")
+            c.execute("INSERT INTO offer_redemptions VALUES(?,?,?,?,?,?,?,?)", (redemption_id, merchant, enrollment["id"], offer["id"], order["id"], now(), data.get("discount_cents", order["discount_cents"]), now()))
+            c.execute("UPDATE offer_enrollments SET linked_guest_id=?,status='redeemed',updated_at=? WHERE id=?", (target_id, now(), enrollment["id"]))
+            self._audit(c, merchant, "offer.redeemed", "offer_redemption", redemption_id, {"order_id": order["id"], "guest_id": target_id})
+        return {"id": redemption_id, "status": "redeemed", "guest_id": target_id, "linked_to_pos": True}
+
+    def offer_dashboard(self, merchant):
+        with self.db.connect() as c:
+            page = c.execute("SELECT slug,active,terms_version,headline FROM merchant_enrollment_pages WHERE merchant_id=?", (merchant,)).fetchone()
+            offers = [dict(row) for row in c.execute("SELECT * FROM merchant_offers WHERE merchant_id=? ORDER BY created_at DESC", (merchant,))]
+            enrollments = [dict(row) for row in c.execute("""SELECT e.id,e.offer_id,e.phone,e.status,e.provider_message_id,e.send_error,e.linked_guest_id,e.consented_at,e.updated_at,
+                EXISTS(SELECT 1 FROM offer_redemptions r WHERE r.enrollment_id=e.id) redeemed FROM offer_enrollments e WHERE e.merchant_id=? ORDER BY e.created_at DESC""", (merchant,))]
+        return {"page": {**dict(page), "enrollment_url": self._enrollment_url(page["slug"])} if page else None, "offers": offers, "enrollments": enrollments}
 
     def verify_inbound_signature(self, raw_body, signature):
         secret = __import__("os").getenv("INBOUND_EMAIL_SECRET", "")
@@ -777,7 +909,14 @@ class OrbitService:
             c.execute("INSERT INTO provider_webhook_events VALUES(?,?,?,?,?,?,?,?,?)", (uid("pwe"), provider, event_id, event_type, json.dumps(metadata or {}), "processing", None, now(), None))
             message = c.execute("SELECT merchant_id FROM outbound_messages WHERE provider=? AND provider_message_id=?", (provider, provider_message_id)).fetchone()
         if not message:
-            with self.db.connect() as c: c.execute("UPDATE provider_webhook_events SET status='unmatched',processed_at=? WHERE provider=? AND provider_event_id=?", (now(), provider, event_id))
+            with self.db.connect() as c:
+                enrollment = c.execute("SELECT id FROM offer_enrollments WHERE provider_message_id=?", (provider_message_id,)).fetchone()
+                if enrollment:
+                    offer_status = {"sent": "offer_sent", "delivered": "delivered", "failed": "send_failed"}.get(normalized, normalized)
+                    c.execute("UPDATE offer_enrollments SET status=?,send_error=?,updated_at=? WHERE id=?", (offer_status, json.dumps(metadata or {}) if normalized == "failed" else None, now(), enrollment["id"]))
+                    c.execute("UPDATE provider_webhook_events SET status='processed',processed_at=? WHERE provider=? AND provider_event_id=?", (now(), provider, event_id))
+                    return {"status": offer_status, "duplicate": False, "offer_enrollment_id": enrollment["id"]}
+                c.execute("UPDATE provider_webhook_events SET status='unmatched',processed_at=? WHERE provider=? AND provider_event_id=?", (now(), provider, event_id))
             return {"status": "unmatched", "duplicate": False}
         result = self.record_message_event(message["merchant_id"], {"provider_message_id": provider_message_id, "event_type": normalized, "occurred_at": occurred, "metadata": metadata or {}})
         with self.db.connect() as c: c.execute("UPDATE provider_webhook_events SET status='processed',processed_at=? WHERE provider=? AND provider_event_id=?", (now(), provider, event_id))

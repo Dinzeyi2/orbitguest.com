@@ -153,3 +153,12 @@ and object-storage encryption before accepting untrusted production attachments.
 
 - `POST /v1/behavior/interactions` records a checkout, prepared-basket, saved-payment, delivery, or pickup observation for a merchant guest.
 - `GET /v1/dashboard/psychology` returns versioned hypotheses, strategy definitions, experiment assignments, conversions, estimated incremental profit, response time, and unsubscribe results.
+
+## Public restaurant offer enrollment
+
+- `POST /v1/offers` configures the merchant's real welcome promo code and discount.
+- `GET /v1/offers` returns the enrollment URL, offer, delivery, link, and redemption states.
+- `GET /join/{slug}` serves the public mobile enrollment form.
+- `GET /v1/public/enroll/{slug}` describes the active offer without exposing its promo code.
+- `POST /v1/public/enroll/{slug}/submit` records terms/SMS consent and sends the first real offer through Telnyx.
+- `POST /v1/offers/redeem` records single-use redemption against an exact POS order and links the verified contact profile to that order's merchant-scoped guest.
