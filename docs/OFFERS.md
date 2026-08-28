@@ -28,18 +28,20 @@ SMS delivery state, POS-link state, and redemption state.
 
 ## Customer flow
 
-The public `GET /join/{slug}` page collects an E.164 phone number, required
-acceptance of the OrbitGuest terms, and a **separate, optional** SMS marketing
-checkbox. It submits to `POST /v1/public/enroll/{slug}/submit`. Submitting
-without SMS consent records no enrollment or identity and sends no message.
+The public `GET /join/{slug}` page collects an E.164 phone number and presents
+the complete SMS and legal disclosure immediately above a clearly labeled
+`Text me the promo code` button. Selecting that button is the customer's
+affirmative action accepting the displayed terms and expressly requesting the
+SMS. No checkbox is used. The page submits to
+`POST /v1/public/enroll/{slug}/submit`.
 Orbit sends exactly one welcome-offer SMS containing the restaurant name, the
 restaurant-configured promo code and terms, and required HELP/STOP instructions.
 Duplicate enrollment for the same phone and offer does not send another text.
 Enrollment attempts are rate limited.
 
 The form links to working `/terms` and `/privacy` pages and displays marketing,
-variable-frequency, message/data-rate, HELP, STOP, optional-consent, and mobile
-data non-sharing disclosures inline.
+variable-frequency, message/data-rate, HELP, STOP, condition-of-purchase, and
+mobile data non-sharing disclosures inline.
 
 ## 10DLC sender registration
 

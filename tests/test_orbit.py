@@ -275,21 +275,20 @@ class OrbitFlowTest(unittest.TestCase):
         self.assertEqual(enrolled["contact_guest_id"], order_guest); self.assertEqual(enrolled["linked_guest_id"], order_guest)
         from orbit.api import Handler
         markup = Handler._enrollment_html(None, slug, page)
-        self.assertIn('id="submit" type="submit">Continue</button>', markup); self.assertIn("/v1/public/enroll/", markup)
+        self.assertIn('id="submit" type="submit">Text me the promo code</button>', markup); self.assertIn("/v1/public/enroll/", markup)
         self.assertNotIn("WELCOME10", markup)
-        self.assertIn("Optional: I agree to receive recurring marketing and promotional text messages from Smokehouse", markup)
+        self.assertIn("By entering your phone number and selecting “Text me the promo code,” you expressly agree", markup)
+        self.assertIn("recurring marketing and promotional text messages from Smokehouse", markup)
         self.assertIn("Message frequency varies", markup); self.assertIn("Reply HELP for help or STOP to opt out", markup)
         self.assertIn("Consent is not a condition of purchase", markup)
         self.assertIn("Your mobile information will not be sold or shared with third parties for promotional or marketing purposes", markup)
         self.assertIn('href="/privacy"', markup); self.assertIn('href="/terms"', markup)
-        self.assertIn('id="sms-consent" type="checkbox"', markup)
-        self.assertNotIn('id="sms-consent" type="checkbox" required', markup)
-        self.assertNotIn('id="submit" type="submit" disabled', markup)
+        self.assertNotIn('type="checkbox"', markup)
+        self.assertIn("accept_terms:true,sms_consent:true", markup)
         with self.assertRaises(ValueError):
             self.service.enroll_in_offer(slug, {"phone": "+15550999999", "accept_terms": False, "sms_consent": False, "terms_version": page["terms_version"]})
-        declined = self.service.enroll_in_offer(slug, {"phone": "+15550999999", "accept_terms": True, "sms_consent": False, "terms_version": page["terms_version"]})
-        self.assertEqual(declined, {"status": "consent_declined", "message_sent": False, "duplicate": False})
-        self.assertEqual(len(self.service.delivery.sent), 1)
+        with self.assertRaises(ValueError):
+            self.service.enroll_in_offer(slug, {"phone": "+15550999999", "accept_terms": True, "sms_consent": False, "terms_version": page["terms_version"]})
 
     def test_offer_redemption_connects_generic_signup_to_exact_pos_identity(self):
         self.service.delivery = FakeDelivery()

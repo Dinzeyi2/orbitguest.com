@@ -97,16 +97,14 @@ class OrbitService:
                 FROM merchant_offers WHERE merchant_id=? AND active=1 AND starts_at<=? AND (ends_at IS NULL OR ends_at>=?)
                 ORDER BY created_at DESC LIMIT 1""", (page["merchant_id"], stamp, stamp)).fetchone()
             if not offer: raise KeyError("no active offer")
-        return {"slug": page["slug"], "merchant_name": page["merchant_name"], "headline": page["headline"], "terms_version": page["terms_version"], "offer": dict(offer), "required": {"phone": "E.164", "accept_terms": True, "sms_consent": False}}
+        return {"slug": page["slug"], "merchant_name": page["merchant_name"], "headline": page["headline"], "terms_version": page["terms_version"], "offer": dict(offer), "required": {"phone": "E.164", "accept_terms": True, "sms_consent": True}}
 
     def enroll_in_offer(self, slug, data):
         phone = re.sub(r"[\s().-]", "", data.get("phone", ""))
         if not re.fullmatch(r"\+[1-9]\d{7,14}", phone): raise ValueError("phone must use E.164 format")
-        if data.get("accept_terms") is not True: raise ValueError("terms acceptance is required")
+        if data.get("accept_terms") is not True or data.get("sms_consent") is not True: raise ValueError("terms acceptance and SMS consent are required")
         page_data = self.public_enrollment_page(slug)
         if data.get("terms_version") != page_data["terms_version"]: raise ValueError("the current terms version must be accepted")
-        if data.get("sms_consent") is not True:
-            return {"status": "consent_declined", "message_sent": False, "duplicate": False}
         merchant, offer_id, stamp = page_data["merchant_id"] if "merchant_id" in page_data else None, page_data["offer"]["id"], now()
         # The public response deliberately omits merchant_id; resolve it again by slug.
         with self.db.connect() as c:
